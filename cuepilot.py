@@ -2847,15 +2847,36 @@ def create_app(argv):
     return app, settings, overlay, panel, hotkeys
 
 
+def _exit_now(code: int):
+    """Exit with exactly this code. On Windows, os._exit still runs every DLL's shutdown
+    handler, and a library can change the exit code there; TerminateProcess skips that."""
+    code = int(code)
+    try:
+        if sys.stdout is not None:
+            sys.stdout.write(f"Self-test finished; exiting with code {code}\n")
+            sys.stdout.flush()
+        if sys.stderr is not None:
+            sys.stderr.flush()
+    except Exception:
+        pass
+    if IS_WINDOWS:
+        try:
+            from ctypes import wintypes as _wt
+            k32 = ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = _wt.HANDLE
+            k32.TerminateProcess.argtypes = [_wt.HANDLE, _wt.UINT]
+            k32.TerminateProcess.restype = _wt.BOOL
+            k32.TerminateProcess(k32.GetCurrentProcess(), code)
+        except Exception:
+            pass
+    os._exit(code)
+
+
 def main():
     if "--selftest" in sys.argv:
         import cuepilot_selftest
         code = cuepilot_selftest.run(sys.modules[__name__], sys.argv)
-        try:
-            sys.stdout and sys.stdout.flush()
-        except Exception:
-            pass
-        os._exit(code)  # skip Qt teardown so the exit code is exactly the test result
+        _exit_now(code)
     install_crash_log()
     app, _settings, _overlay, _panel, hotkeys = create_app(sys.argv)
     rc = app.exec()
