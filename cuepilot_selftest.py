@@ -62,6 +62,9 @@ def start_mock_server(cp, delay=0.25):
             length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"{}")
             headers = {k.lower(): v for k, v in self.headers.items()}
+            if headers.get("user-agent", "").startswith("Python-urllib"):
+                self._send(403, {"error": {"message": "generic Python client blocked"}})
+                return
             if self.path.endswith("/v1/messages"):
                 system = body.get("system", "")
                 user = body["messages"][0]["content"]
@@ -130,6 +133,11 @@ def start_mock_transcribe_server():
             raw = self.rfile.read(length)
             ctype = self.headers.get("Content-Type", "")
             auth = self.headers.get("Authorization", "")
+            if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+                self.send_response(403)        # like Cloudflare in front of real APIs
+                self.end_headers()
+                self.wfile.write(b"error code: 1010")
+                return
             entry = {"path": self.path, "auth": auth,
                      "multipart": "multipart/form-data" in ctype,
                      "has_file": b'name="file"' in raw and b"RIFF" in raw,
@@ -169,6 +177,11 @@ def start_mock_embed_server(vec_fn):
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(length) or b"{}")
+            if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"error code: 1010")
+                return
             calls.append(self.path)
             inputs = body.get("input")
             if not isinstance(inputs, list):

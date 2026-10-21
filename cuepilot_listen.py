@@ -313,7 +313,9 @@ def transcribe_cloud(cfg: dict, wav_bytes: bytes, timeout: float = 60) -> str:
     body += wav_bytes + crlf + f"--{boundary}--{crlf.decode()}".encode()
 
     headers = {"Content-Type": f"multipart/form-data; boundary={boundary}",
-               "Content-Length": str(len(body))}
+               "Content-Length": str(len(body)),
+               "User-Agent": "CuePilot/1.0",
+               "Accept": "application/json"}
     if cfg.get("api_key"):
         headers["Authorization"] = "Bearer " + cfg["api_key"]
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -322,16 +324,13 @@ def transcribe_cloud(cfg: dict, wav_bytes: bytes, timeout: float = 60) -> str:
             import json
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            import json
-            payload = json.loads(exc.read().decode("utf-8", "replace"))
-            err = payload.get("error", payload) if isinstance(payload, dict) else payload
-            detail = err.get("message", "") if isinstance(err, dict) else str(err)
-        except Exception:
-            pass
-        hint = {401: "check the transcription API key", 404: "check the server URL and model",
-                413: "the audio chunk was too large", 429: "rate limit reached, try again"}.get(exc.code, "")
+        detail = _error_detail(exc)
+        hint = {401: "check the transcription API key",
+                403: "the request was refused; check the key, and on a work network a firewall "
+                     "may be blocking it",
+                404: "check the server URL and model",
+                413: "the audio chunk was too large",
+                429: "rate limit reached, try again"}.get(exc.code, "")
         msg = f"Transcription failed (HTTP {exc.code})"
         if detail:
             msg += f": {detail}"
@@ -345,6 +344,25 @@ def transcribe_cloud(cfg: dict, wav_bytes: bytes, timeout: float = 60) -> str:
     except Exception as exc:
         raise STTError(f"Transcription failed: {exc}") from None
     return (data.get("text") or "").strip()
+
+
+def _error_detail(exc) -> str:
+    """Pull a readable reason out of an HTTP error, JSON or not."""
+    try:
+        raw = exc.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        import json
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            err = payload.get("error") or payload.get("detail") or payload.get("message") or ""
+        else:
+            err = payload
+        text = err.get("message", "") if isinstance(err, dict) else str(err)
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", raw)  # plain text or an HTML error page
+    return re.sub(r"\s+", " ", text).strip()[:200]
 
 
 class LocalWhisper:

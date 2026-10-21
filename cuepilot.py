@@ -481,14 +481,16 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: float):
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
+        raw = ""
         try:
-            payload = json.loads(exc.read().decode("utf-8", "replace"))
+            raw = exc.read().decode("utf-8", "replace")
+            payload = json.loads(raw)
             if isinstance(payload, list) and payload:
                 payload = payload[0]
             err = payload.get("error", payload) if isinstance(payload, dict) else payload
             detail = err.get("message", "") if isinstance(err, dict) else str(err)
         except Exception:
-            pass
+            detail = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)).strip()[:200]
         hint = {401: "check the API key", 403: "this key has no access to that model",
                 404: "check the server URL and model name",
                 429: "rate limit or quota reached, try again shortly"}.get(exc.code, "")
@@ -1682,9 +1684,10 @@ class ControlPanel(QMainWindow):
 
     def _start_listen(self):
         if not self.consent_chk.isChecked():
-            self._set_listen_status("Confirm everyone on the call knows they're being transcribed "
-                                    "before you start.", error=True)
-            self.consent_chk.setFocus()
+            self._set_listen_status("Listening hasn't started. Tick 'Everyone on the call knows it's "
+                                    "being transcribed' (highlighted above), then click Start "
+                                    "listening again.", error=True)
+            self._point_at(self.consent_chk)
             return
         ok, msg = listen.capture_available()
         if not ok:
@@ -1736,6 +1739,17 @@ class ControlPanel(QMainWindow):
         self._detect_buffer = []
         self.listen_level.setText("")
         self._set_listen_status("Stopped listening.")
+
+    def _point_at(self, widget):
+        """Scroll a control into view and flash it amber for a few seconds."""
+        try:
+            self.tabs.setCurrentWidget(self.ai_tab)
+            self.ai_tab.ensureWidgetVisible(widget, 40, 80)
+        except Exception:
+            pass
+        widget.setFocus()
+        widget.setStyleSheet(f"QCheckBox {{ color: {AMBER}; font-weight: 600; }}")
+        QTimer.singleShot(4000, lambda: widget.setStyleSheet(""))
 
     def _restyle(self, widget):
         widget.style().unpolish(widget)
@@ -2129,7 +2143,8 @@ class ControlPanel(QMainWindow):
         if self.contextual_chk.isChecked():
             ai_cfg, ai_err = self._ai_config()
             if not ai_err:
-                context_ai = {"complete": lambda sysm, usr, mx: ai_complete(ai_cfg, sysm, usr, mx)}
+                context_ai = {"complete": lambda sysm, usr, mx: ai_complete(ai_cfg, sysm, usr, mx,
+                                                                            timeout=25)}
         self._embed_stop = False
         self.doc_status.setStyleSheet(f"color: {MUTED};")
         self.doc_status.setText("Preparing smart search…")

@@ -269,27 +269,68 @@ def keyword_scores(question: str, passages):
 # =============================================================================
 # Embeddings (optional, better matching)
 # =============================================================================
-def _post_json(url, body, headers, timeout=60):
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                 headers=headers, method="POST")
+RETRY_CODES = (429, 500, 502, 503, 504)
+
+
+def _post_json(url, body, headers, timeout=60, retries=4):
+    """POST JSON. On a rate limit (429) or a temporary server error, wait and retry, as Voyage's
+    docs recommend: honour Retry-After if given, otherwise back off 1, 2, 4, 8 seconds."""
+    import time as _time
+    data = json.dumps(body).encode("utf-8")
+    attempt = 0
+    while True:
+        try:
+            return _post_json_once(url, data, headers, timeout)
+        except _Retryable as r:
+            if attempt >= retries:
+                raise DocError(r.message) from None
+            wait = r.retry_after if r.retry_after is not None else min(15.0, 2.0 ** attempt)
+            _time.sleep(max(0.5, min(wait, 30.0)))
+            attempt += 1
+
+
+class _Retryable(Exception):
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.message = message
+        self.retry_after = retry_after
+
+
+def _post_json_once(url, data, headers, timeout):
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
+        raw = ""
         try:
-            payload = json.loads(exc.read().decode("utf-8", "replace"))
-            err = payload.get("error", payload) if isinstance(payload, dict) else payload
-            detail = err.get("message", "") if isinstance(err, dict) else str(err)
+            raw = exc.read().decode("utf-8", "replace")
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                err = payload.get("error") or payload.get("detail") or payload.get("message") or ""
+            else:
+                err = payload
+            detail = (err.get("message", "") if isinstance(err, dict) else str(err))[:300]
         except Exception:
-            pass
-        hint = {401: "check the embeddings API key", 404: "check the server URL and model name",
+            detail = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw)).strip()[:200]
+        hint = {401: "check the embeddings API key",
+                403: "the key was refused; check it, and that the server URL matches where the key "
+                     "came from (Voyage keys starting 'al-' use https://ai.mongodb.com/v1)",
+                404: "check the server URL and model name",
                 429: "rate limit reached"}.get(exc.code, "")
         msg = f"Embeddings failed (HTTP {exc.code})"
         if detail:
             msg += f": {detail}"
         if hint:
             msg += f" ({hint})"
+        if exc.code in RETRY_CODES:
+            retry_after = None
+            try:
+                retry_after = float(exc.headers.get("Retry-After"))
+            except Exception:
+                pass
+            raise _Retryable(msg, retry_after) from None
         raise DocError(msg) from None
     except urllib.error.URLError as exc:
         host = urllib.parse.urlsplit(url).netloc or url
@@ -298,8 +339,17 @@ def _post_json(url, body, headers, timeout=60):
         raise DocError(f"Embeddings failed: {exc}") from None
 
 
-def embed_texts(cfg: dict, texts, timeout=120):
-    """Return a list of vectors for the given texts via an OpenAI-style embeddings endpoint."""
+EMBED_BATCH = 32  # small enough for free-tier per-minute token limits
+
+
+def _is_voyage(base: str) -> bool:
+    b = base.lower()
+    return "voyageai.com" in b or "ai.mongodb.com" in b
+
+
+def embed_texts(cfg: dict, texts, timeout=120, input_type=None, retries=4):
+    """Return a list of vectors for the given texts via an OpenAI-style embeddings endpoint.
+    input_type ('document' or 'query') is sent to Voyage, which matches better with it."""
     base = cfg["base_url"].strip().rstrip("/")
     if not base:
         raise DocError("No embeddings server URL is set.")
@@ -307,11 +357,12 @@ def embed_texts(cfg: dict, texts, timeout=120):
     if cfg.get("api_key"):
         headers["Authorization"] = "Bearer " + cfg["api_key"]
     out = []
-    # Batch to keep requests reasonable.
-    for i in range(0, len(texts), 64):
-        batch = texts[i:i + 64]
+    for i in range(0, len(texts), EMBED_BATCH):
+        batch = texts[i:i + EMBED_BATCH]
         body = {"model": cfg["model"], "input": batch}
-        data = _post_json(base + "/embeddings", body, headers, timeout)
+        if input_type and _is_voyage(base):
+            body["input_type"] = input_type
+        data = _post_json(base + "/embeddings", body, headers, timeout, retries)
         try:
             rows = sorted(data["data"], key=lambda d: d.get("index", 0))
             out.extend(r["embedding"] for r in rows)
@@ -380,28 +431,59 @@ class ReferenceDoc:
         if not self.passages:
             return
         full = "\n\n".join(p["text"] for p in self.passages)[:16000]
+        contexts = self._build_contexts(full, context_ai, on_progress, should_stop)
+        if contexts is None:
+            return  # stopped
         to_embed = []
-        for i, p in enumerate(self.passages):
-            if should_stop and should_stop():
-                return
-            ctx = ""
-            if context_ai is not None:
-                try:
-                    ctx = _passage_context(context_ai, full, p["text"])
-                except Exception:
-                    ctx = ""
+        for p, ctx in zip(self.passages, contexts):
             p["context"] = ctx
             header = (f"{p['heading']}. " if p["heading"] else "") + (ctx + " " if ctx else "")
             to_embed.append((header + p["text"]).strip())
-            if on_progress:
-                on_progress(i + 1, len(self.passages), "preparing")
         if should_stop and should_stop():
             return
         if on_progress:
             on_progress(len(self.passages), len(self.passages), "embedding")
-        self.vectors = embed_texts(embed_cfg, to_embed)
+        self.vectors = embed_texts(embed_cfg, to_embed, input_type="document")
         self.embedded = len(self.vectors) == len(self.passages)
-        self.contextual = self.embedded and context_ai is not None
+        self.contextual = self.embedded and any(contexts)
+
+    CONTEXT_WORKERS = 4
+    CONTEXT_GIVE_UP_AFTER = 3  # consecutive failures before skipping context notes
+
+    def _build_contexts(self, full, context_ai, on_progress, should_stop):
+        """One-line context notes for every passage, written by the AI several at a time. If the
+        AI keeps failing, stop asking and carry on without notes rather than stalling."""
+        n = len(self.passages)
+        if context_ai is None:
+            return [""] * n
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = [""] * n
+        failures = 0
+        done = 0
+        gave_up = threading.Event()
+
+        def one(i):
+            if gave_up.is_set() or (should_stop and should_stop()):
+                return i, None
+            return i, _passage_context(context_ai, full, self.passages[i]["text"])
+
+        with ThreadPoolExecutor(max_workers=self.CONTEXT_WORKERS) as pool:
+            futures = [pool.submit(one, i) for i in range(n)]
+            for fut in as_completed(futures):
+                i, ctx = fut.result()
+                done += 1
+                if ctx:
+                    results[i] = ctx
+                    failures = 0
+                elif ctx == "":
+                    failures += 1
+                    if failures >= self.CONTEXT_GIVE_UP_AFTER:
+                        gave_up.set()
+                if on_progress:
+                    on_progress(done, n, "preparing")
+        if should_stop and should_stop():
+            return None
+        return results
 
     def search_keyword(self, question: str, top_k=1):
         """Instant, offline keyword search. No network, returns at once."""
@@ -416,7 +498,9 @@ class ReferenceDoc:
         if not self.passages or not self.embedded or embed_cfg is None:
             return self.search_keyword(question, top_k)
         kw = keyword_scores(question, self.passages)
-        qvec = embed_texts(embed_cfg, [question])[0]
+        # Fast path for a live question: short timeout and no retries, so a slow moment falls back
+        # to the keyword result that's already on screen instead of making you wait.
+        qvec = embed_texts(embed_cfg, [question], timeout=8, input_type="query", retries=0)[0]
         sem = cosine_scores(qvec, self.vectors)
         if not sem or len(sem) != len(self.passages):
             return self._rank(question, kw, "keyword", top_k)
@@ -455,7 +539,8 @@ class ReferenceDoc:
 
 
 def _passage_context(context_ai, full_doc: str, passage: str) -> str:
-    from_app = context_ai["complete"]  # a callable (system, user, max_tokens) -> str
+    from_app = context_ai["complete"]  # a callable (system, user, max_tokens) -> str; it should
+    # use a short timeout of its own so one slow reply can't hold up the document
     user = (f"<document>\n{full_doc}\n</document>\n\n<passage>\n{passage[:1500]}\n</passage>\n\n"
             "Give the one-sentence context for the passage.")
     try:
@@ -475,4 +560,21 @@ def build_embed_config(provider_name: str, url: str, key: str, model: str):
         key = os.environ.get(meta["env"], "")
     if not key.strip():
         return None, f"Add an API key for {provider_name} embeddings."
-    return {"base_url": url.strip(), "api_key": key.strip(), "model": model.strip()}, None
+    return {"base_url": voyage_host_for_key(url.strip(), key.strip()), "api_key": key.strip(),
+            "model": model.strip()}, None
+
+
+VOYAGE_DIRECT = "https://api.voyageai.com/v1"
+VOYAGE_ATLAS = "https://ai.mongodb.com/v1"
+
+
+def voyage_host_for_key(url: str, key: str) -> str:
+    """Voyage is part of MongoDB: keys from MongoDB Atlas start with 'al-' and only work at
+    ai.mongodb.com; keys from the Voyage dashboard start with 'pa-' and only work at
+    api.voyageai.com. Each host refuses the other's keys with HTTP 403, so pick the right one."""
+    host = url.rstrip("/").lower()
+    if key.startswith("al-") and "api.voyageai.com" in host:
+        return VOYAGE_ATLAS
+    if key.startswith("pa-") and "ai.mongodb.com" in host:
+        return VOYAGE_DIRECT
+    return url
