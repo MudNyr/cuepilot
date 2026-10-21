@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+SELFTEST_BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
 IS_WIN = sys.platform == "win32"
 
 SCRIPT_REPLY = "```\n# Opening\nHello team.\n\nThis is the **drafted** script. [PAUSE]\n```"
@@ -424,6 +425,19 @@ class SelfTest:
     # ================================================================ tests
     def t_startup(self):
         cp, ov, p = self.cp, self.ov, self.panel
+        # Every file must come from the same update; a stale file causes confusing failures.
+        import importlib
+        stamps = {"cuepilot.py": getattr(cp, "APP_BUILD", "missing"),
+                  "cuepilot_selftest.py": SELFTEST_BUILD}
+        for mod in ("cuepilot_listen", "cuepilot_docs", "cuepilot_google"):
+            try:
+                stamps[mod + ".py"] = getattr(importlib.import_module(mod), "BUILD", "missing (old file)")
+            except Exception as exc:
+                stamps[mod + ".py"] = f"can't load ({exc.__class__.__name__})"
+        newest = getattr(cp, "APP_BUILD", SELFTEST_BUILD)
+        stale = [f"{name} is {b}" for name, b in stamps.items() if b != newest]
+        self.check("all CuePilot files are from the same update", not stale,
+                   f"expected build {newest}; upload the latest copy of: " + "; ".join(stale))
         self.check("control panel opens", p.isVisible())
         self.check("prompter opens", ov.isVisible())
         self.check("sample script loads on first run", p.editor.toPlainText() == cp.SAMPLE_SCRIPT)

@@ -17,6 +17,8 @@ This module has no Qt dependency, so it can be unit-tested on its own.
 """
 from __future__ import annotations
 
+BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
+
 import json
 import math
 import os
@@ -55,8 +57,10 @@ EMBED_PROVIDERS = {
                                              "model": "voyage-4-lite", "env": "VOYAGE_API_KEY"},
     "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "text-embedding-3-small",
                "env": "OPENAI_API_KEY"},
-    "Google Gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-                      "model": "text-embedding-004", "env": "GEMINI_API_KEY"},
+    # text-embedding-004 was retired in January 2026; gemini-embedding-001 replaced it.
+    "Google Gemini (free tier, no card)": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "model": "gemini-embedding-001", "env": "GEMINI_API_KEY"},
     "Custom (OpenAI-compatible)": {"base_url": "", "model": "", "env": ""},
 }
 
@@ -560,7 +564,10 @@ def build_embed_config(provider_name: str, url: str, key: str, model: str):
         key = os.environ.get(meta["env"], "")
     if not key.strip():
         return None, f"Add an API key for {provider_name} embeddings."
-    return {"base_url": voyage_host_for_key(url.strip(), key.strip()), "api_key": key.strip(),
+    url = re.sub(r"/vi(?=/|$)", "/v1", url.strip().rstrip("/"), flags=re.IGNORECASE)
+    if url.lower().endswith("/embeddings"):
+        url = url[: -len("/embeddings")].rstrip("/")
+    return {"base_url": voyage_host_for_key(url, key.strip()), "api_key": key.strip(),
             "model": model.strip()}, None
 
 

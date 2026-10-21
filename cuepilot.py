@@ -66,6 +66,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
 
 APP_NAME = "CuePilot"
 APP_VERSION = "1.0"
+APP_BUILD = "2026.10.21-5"  # all CuePilot files must carry the same build
 IS_WINDOWS = sys.platform == "win32"
 
 # Palette: a studio control room. Slate surfaces, an amber cue light, a red tally for "live".

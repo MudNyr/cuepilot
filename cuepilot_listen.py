@@ -17,6 +17,8 @@ rather than failing. This module has no Qt dependency, so it can be unit-tested 
 """
 from __future__ import annotations
 
+BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
+
 import array
 import io
 import math
@@ -77,6 +79,24 @@ QUESTION_WORDS = {
 QUESTION_PHRASES = ("tell me", "tell us", "walk me", "walk us", "explain", "describe",
                     "talk about", "talk us", "give us", "give me", "help me understand",
                     "i'd like to know", "i would like to know", "what about", "how about")
+
+
+def normalize_base_url(url: str, endpoint_suffixes=()) -> str:
+    """Tidy a pasted server address: trim spaces and slashes, fix 'vi' typed for 'v1', and drop
+    endpoint paths people paste by mistake (the app adds the endpoint itself)."""
+    u = (url or "").strip().rstrip("/")
+    u = re.sub(r"/vi(?=/|$)", "/v1", u, flags=re.IGNORECASE)
+    changed = True
+    while changed and u:
+        changed = False
+        for suffix in endpoint_suffixes:
+            if u.lower().endswith(suffix):
+                u = u[: -len(suffix)].rstrip("/")
+                changed = True
+    return u
+
+
+STT_SUFFIXES = ("/audio/transcriptions", "/audio/translations", "/audio")
 
 
 def looks_like_question(text: str) -> bool:
@@ -294,7 +314,7 @@ def transcribe_cloud(cfg: dict, wav_bytes: bytes, timeout: float = 60) -> str:
     import urllib.error
     import urllib.request
 
-    base = cfg["base_url"].strip().rstrip("/")
+    base = normalize_base_url(cfg["base_url"], STT_SUFFIXES)
     if not base:
         raise STTError("No transcription server URL is set.")
     url = base + "/audio/transcriptions"
@@ -614,11 +634,12 @@ class Listener:
 
     # --------- phrase handling
     def _on_phrase(self, label, samples):
+        ended_at = time.monotonic()  # when this phrase finished; compared across the two streams
         wav = samples_to_wav(samples)
         with self._queue_lock:
             # Keep your own phrases prioritised so echo notes are recorded before the
             # matching far-end phrase is transcribed; otherwise drop the oldest far-end audio.
-            self._queue.append((label, wav))
+            self._queue.append((label, wav, ended_at))
             if len(self._queue) > 16:
                 them = [item for item in self._queue if item[0] == THEM]
                 mine = [item for item in self._queue if item[0] == ME]
@@ -630,16 +651,30 @@ class Listener:
             return self._local.transcribe(wav, self.cfg.get("language", ""))
         return transcribe_cloud(self.cfg, wav)
 
+    # When both streams hear the same words, timing says which copy is real:
+    #  * Bleed: on speakers, the mic hears the far end at the same moment the speakers play it.
+    #    The mic copy is fake; the far-end line is kept. This is the common case.
+    #  * Echo: the call sends your own voice back. It arrives after a network delay, so your mic
+    #    phrase ended clearly earlier. The far-end copy is fake and dropped.
+    ECHO_LAG = 0.3        # your phrase must end at least this much earlier to count as echoed back
+    BLEED_WINDOW = 1.0    # far-end and mic phrases ending this close together are the same sound
+    ME_HOLD = 1.5         # hold your lines briefly so a matching far-end line can claim them
+    MATCH_KEEP = 8.0      # how long to remember phrases for matching (seconds)
+
     def _transcribe_loop(self):
+        self._recent_them = []   # (end_time, text)
+        self._recent_me = []     # (end_time, text)
+        self._pending_me = []    # (end_time, text, transcribed_at)
         while not self._stop.is_set():
-            self._wake.wait(timeout=0.5)
+            self._wake.wait(timeout=0.3)
             self._wake.clear()
             while not self._stop.is_set():
                 with self._queue_lock:
                     item = self._queue.pop(0) if self._queue else None
                 if item is None:
                     break
-                label, wav = item
+                label, wav = item[0], item[1]
+                t_end = item[2] if len(item) > 2 else time.monotonic()
                 try:
                     text = self._transcribe_one(wav)
                 except STTError as exc:
@@ -652,15 +687,67 @@ class Listener:
                 if not _is_meaningful(text):
                     continue
                 if label == ME:
-                    # Your own voice: remember it for echo filtering, show it, never answer it.
-                    if self.suppress_echo:
-                        self._echo.note_own_speech(text)
-                    self.on_transcript(text, False, ME)
+                    self._handle_me(text, t_end)
+                else:
+                    self._handle_them(text, t_end)
+            self._flush_pending_me()
+        self._flush_pending_me(force=True)
+
+    @staticmethod
+    def _overlap(a, b):
+        """Share of the shorter phrase's words found in the longer one (handles partial copies)."""
+        wa, wb = _word_set(a), _word_set(b)
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / min(len(wa), len(wb))
+
+    def _handle_me(self, text, t_end):
+        if not self.suppress_echo:
+            self.on_transcript(text, False, ME)
+            return
+        # Bleed: the far end already said this at the same moment, so the mic just overheard it.
+        for te, tt in self._recent_them:
+            if abs(t_end - te) <= self.BLEED_WINDOW and self._overlap(text, tt) >= ECHO_SIMILARITY:
+                return
+        self._pending_me.append((t_end, text, time.monotonic()))
+
+    def _handle_them(self, text, t_end):
+        if self.suppress_echo:
+            # Any of your held lines that are really this far-end sound overheard: discard them.
+            kept = []
+            for te, mt, ts in self._pending_me:
+                if abs(t_end - te) <= self.BLEED_WINDOW and t_end - te < self.ECHO_LAG \
+                        and self._overlap(mt, text) >= ECHO_SIMILARITY:
                     continue
-                # Far end. Drop it if it's your own voice echoing back through the call.
-                if self.suppress_echo and self._echo.is_echo(text):
-                    continue
-                self.on_transcript(text, looks_like_question(text), THEM)
+                kept.append((te, mt, ts))
+            self._pending_me = kept
+            # Echo: you said this clearly earlier, and the call has sent it back.
+            mine = [(te, mt) for te, mt, _ts in self._pending_me] + self._recent_me
+            for te, mt in mine:
+                lag = t_end - te
+                if self.ECHO_LAG <= lag <= ECHO_WINDOW and text_similarity(text, mt) >= ECHO_SIMILARITY:
+                    self._remember(self._recent_them, t_end, text)
+                    return
+        self._remember(self._recent_them, t_end, text)
+        self.on_transcript(text, looks_like_question(text), THEM)
+
+    def _flush_pending_me(self, force=False):
+        if not getattr(self, "_pending_me", None):
+            return
+        now = time.monotonic()
+        still = []
+        for te, mt, ts in self._pending_me:
+            if force or now - ts >= self.ME_HOLD:
+                self._remember(self._recent_me, te, mt)
+                self.on_transcript(mt, False, ME)
+            else:
+                still.append((te, mt, ts))
+        self._pending_me = still
+
+    def _remember(self, lst, t_end, text):
+        lst.append((t_end, text))
+        cutoff = time.monotonic() - self.MATCH_KEEP
+        lst[:] = [(t, x) for t, x in lst if t >= cutoff]
 
 
 # Whisper emits these for near-silence or background noise; drop them.
@@ -691,8 +778,8 @@ def build_stt_config(provider_name: str, url: str, key: str, model: str, languag
         key = os.environ.get(meta["env"], "")
     if meta["needs_key"] and not key.strip():
         return None, f"Add an API key for {provider_name}. {meta['hint']}"
-    return {"kind": "cloud", "base_url": url.strip(), "api_key": key.strip(),
-            "model": model.strip(), "language": language.strip()}, None
+    return {"kind": "cloud", "base_url": normalize_base_url(url, STT_SUFFIXES),
+            "api_key": key.strip(), "model": model.strip(), "language": language.strip()}, None
 
 
 mimetypes.add_type("audio/wav", ".wav")
