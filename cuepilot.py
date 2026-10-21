@@ -268,7 +268,7 @@ DEFAULTS = {
     "auto_answer_questions": False,
     "listen_consent_ack": False,
     "doc_path": "",
-    "embed_provider": "OpenAI",
+    "embed_provider": "Voyage AI (recommended by Anthropic)",
     "embed_profiles": {},
     "use_contextual": True,
     "project_doc_on_question": True,
@@ -330,7 +330,7 @@ def load_settings() -> dict:
             prof.setdefault("model", meta["model"])
             prof.setdefault("api_key", "")
         if s["embed_provider"] not in docs.EMBED_PROVIDERS:
-            s["embed_provider"] = "OpenAI"
+            s["embed_provider"] = "Voyage AI (recommended by Anthropic)"
     if s["provider"] not in PROVIDERS:
         s["provider"] = DEFAULT_PROVIDER
     return s

@@ -97,11 +97,11 @@ Supported files: PDF, Word (.docx), and plain text or markdown.
 
 | Search | Needs | What it does |
 |---|---|---|
-| Contextual | an embeddings key + your AI key | Before matching, it adds a one-line note to each passage saying where it sits in the document, so an isolated paragraph about "throughput under load" still matches a question about "scaling". On by default. |
+| Contextual | an embeddings key (e.g. Voyage AI) + your Claude key | Before matching, it adds a one-line note to each passage saying where it sits in the document, so an isolated paragraph about "throughput under load" still matches a question about "scaling". On by default. |
 | Smart (semantic) | an embeddings key | Matches by meaning, so different words for the same idea still match. |
 | Keyword | nothing | Matches shared words. Free, offline, instant. Always available as a fallback. |
 
-Smart and contextual search use an embeddings API (OpenAI's `text-embedding-3-small` or Gemini's are cheap). Set it under **Smart search** in the document section. The document is embedded once when you upload it, which takes a few seconds; after that each question is one tiny lookup. Contextual search also makes one small call per passage to your main AI when the document loads, to write those context notes. Without an embeddings key, keyword search still works.
+Smart and contextual search use an embeddings API. Anthropic doesn't make an embeddings model and recommends Voyage AI, so that's the default (`voyage-4-lite`; get a key at voyageai.com). OpenAI's and Gemini's embeddings work too. Set it under **Smart search** in the document section. The document is embedded once when you upload it, which takes a few seconds; after that each question is one tiny lookup. Contextual search also makes one small call per passage to your main AI when the document loads, to write those context notes. Without an embeddings key, keyword search still works.
 
 How to use it:
 

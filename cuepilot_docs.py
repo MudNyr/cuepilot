@@ -50,6 +50,9 @@ STOPWORDS = {
 }
 
 EMBED_PROVIDERS = {
+    # Anthropic doesn't make an embeddings model; its docs recommend Voyage AI.
+    "Voyage AI (recommended by Anthropic)": {"base_url": "https://api.voyageai.com/v1",
+                                             "model": "voyage-4-lite", "env": "VOYAGE_API_KEY"},
     "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "text-embedding-3-small",
                "env": "OPENAI_API_KEY"},
     "Google Gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
