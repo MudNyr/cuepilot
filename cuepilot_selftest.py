@@ -88,14 +88,16 @@ def start_mock_server(cp, delay=0.25):
             elif system == cp.SYSTEM_SCRIPT:
                 text = SCRIPT_REPLY
             elif system == cp.SYSTEM_DETECT:
-                # Pretend to understand: flag a line containing '?' or a question word.
-                low = user.lower()
-                is_q = ("?" in user or any(w in low for w in
-                        ("what", "how", "why", "walk me", "tell me", "explain", "experience with")))
+                # Pretend to understand: judge only the other person's latest line, not the
+                # app's own instruction text (which always contains a question mark).
+                them = [ln[len("Them:"):].strip() for ln in user.splitlines()
+                        if ln.startswith("Them:")]
+                last = them[-1] if them else ""
+                low = last.lower()
+                is_q = bool(last) and ("?" in last or any(
+                    w in low for w in ("what", "how", "why", "walk me", "tell me", "explain")))
                 if is_q:
-                    last = [ln for ln in user.splitlines() if ln.startswith("Them:")]
-                    q = last[-1][len("Them:"):].strip() if last else "What is your experience?"
-                    text = '{"question": "%s"}' % q.replace('"', "'")
+                    text = '{"question": "%s"}' % last.replace('"', "'")
                 else:
                     text = '{"question": null}'
             elif system == cp.SYSTEM_ASK:
@@ -293,7 +295,14 @@ class SelfTest:
         return bool(cond())
 
     def ai_wait(self, timeout=15.0):
-        return self.wait_for(lambda: not self.panel._busy, timeout)
+        """Wait until every AI request has finished: the single-slot ones (_busy) and the parallel
+        answer and question-detection requests."""
+        p = self.panel
+
+        def idle():
+            return (not p._busy and not getattr(p, "_answer_requests", set())
+                    and not getattr(p, "_detect_requests", set()))
+        return self.wait_for(idle, timeout)
 
     def set_script(self, text):
         self.panel.editor.setPlainText(text)
@@ -426,8 +435,8 @@ class SelfTest:
     def t_rendering(self):
         ov, s = self.ov, self.s
         s["guide_enabled"] = False
-        self.set_script("Hello team, this is a rendering test.\nSecond line with a cue [PAUSE]\n\n"
-                        "**Emphasis** line")
+        # Short lines: at 30 pt a long line wraps, which could push the cue below the window.
+        self.set_script("[PAUSE] Hello team\nShort second line\n\n**Emphasis** line")
         img = self.grab_overlay()
         text_px = self.count_pixels(img, self.near(s["text_color"]))
         self.check("script text is drawn", text_px > 30, f"{text_px} text-coloured pixels")
@@ -546,6 +555,8 @@ class SelfTest:
                    set(ov._edges_at(QPoint(w - 2, h - 2))) == {Qt.Edge.RightEdge, Qt.Edge.BottomEdge})
         self.check("the middle is a drag area", ov._edges_at(QPoint(w // 2, h // 2)) == [])
 
+        # Short rows that never wrap, so script line N is N line-heights down.
+        self.set_script("\n".join(f"Row {i}" for i in range(40)))
         ov.offset = 0
         self.check("reading line starts on the first line", ov.reading_line_index() == 0)
         ov.offset = 5 * ov._line_h + 1
@@ -1190,8 +1201,8 @@ class SelfTest:
                 # a far-end statement appears but is NOT flagged by the AI
                 nq = len(p._questions)
                 p.listener.say("So we shipped it last quarter", listen.THEM)
-                self.wait_for(lambda: not p._detect_requests, 8)
-                self.pump(0.2)
+                self.pump(0.2)        # let the detection timer fire
+                self.ai_wait(8)       # then let the detection request finish
                 self.check("statements show in the transcript",
                            "shipped it last quarter" in p.transcript_box.toPlainText())
                 self.check("the AI does not flag a plain statement as a question",
@@ -1203,7 +1214,7 @@ class SelfTest:
                 before_answer = p.answer_box.toPlainText()
                 p.listener.say("What is the deadline for this?", listen.ME)   # you asking
                 self.pump(0.3)
-                self.wait_for(lambda: not p._detect_requests, 4)
+                self.ai_wait(6)
                 self.check("your own voice is shown in the transcript",
                            "deadline for this" in p.transcript_box.toPlainText())
                 self.check("your own question is never sent for detection or answered",
@@ -1243,10 +1254,11 @@ class SelfTest:
                            ok, p.answer_box.toPlainText())
 
                 # a repeated question isn't flagged twice
+                self.ai_wait(12)      # let the auto-answer from the first ask settle
                 nq = len(p._questions)
                 p.listener.say("How would you scale this across orgs?", listen.THEM)
-                self.wait_for(lambda: not p._detect_requests, 8)
-                self.pump(0.3)
+                self.pump(0.2)
+                self.ai_wait(8)
                 self.check("a repeated question isn't flagged again",
                            len(p._questions) == nq, f"{p._questions}")
 

@@ -548,19 +548,23 @@ def ai_complete(cfg: dict, system: str, user: str, max_tokens: int = 1500,
 class AIRequest(QObject):
     """Runs one AI call on a daemon thread and reports back through queued signals."""
     succeeded = Signal(str)
+    result = Signal(str, object)   # text, the request itself (for per-request metadata)
     failed = Signal(str)
     done = Signal(object)
 
     def __init__(self, cfg, system, user, max_tokens, parent=None):
         super().__init__(parent)
         self._args = (cfg, system, user, max_tokens)
+        self.meta = {}
 
     def start(self):
         threading.Thread(target=self._run, name="ai-request", daemon=True).start()
 
     def _run(self):
         try:
-            self.succeeded.emit(ai_complete(*self._args))
+            text = ai_complete(*self._args)
+            self.succeeded.emit(text)
+            self.result.emit(text, self)
         except Exception as exc:
             self.failed.emit(str(exc) or exc.__class__.__name__)
         finally:
@@ -1799,10 +1803,17 @@ class ControlPanel(QMainWindow):
                 + "\n\nIs there a question the speaker should answer now?")
         req = AIRequest(cfg, SYSTEM_DETECT, user, 200, self)
         req.succeeded.connect(self._on_detection)
-        req.failed.connect(lambda msg: None)  # a failed detection is silent; the next line retries
-        req.done.connect(self._detect_requests.discard)
+        req.failed.connect(self._on_detection_failed)
+        req.done.connect(self._on_detection_done)
         self._detect_requests.add(req)
         req.start()
+
+    def _on_detection_failed(self, _msg):
+        pass  # a failed detection is silent; the next far-end line retries
+
+    def _on_detection_done(self, req):
+        self._detect_requests.discard(req)
+        req.deleteLater()
 
     def _on_detection(self, reply):
         question = self._parse_detected_question(reply)
@@ -1862,19 +1873,6 @@ class ControlPanel(QMainWindow):
             fmt.setForeground(QColor(AMBER))
         else:
             fmt.setForeground(QColor(MUTED) if mine else QColor(self.s["text_color"]))
-        if self.transcript_box.document().characterCount() > 1:
-            cursor.insertBlock()
-        cursor.setCharFormat(fmt)
-        cursor.insertText(line)
-        self.transcript_box.setTextCursor(cursor)
-        bar = self.transcript_box.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _append_transcript_line(self, line, mine=False):
-        cursor = self.transcript_box.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(MUTED) if mine else QColor(self.s["text_color"]))
         if self.transcript_box.document().characterCount() > 1:
             cursor.insertBlock()
         cursor.setCharFormat(fmt)
@@ -2659,7 +2657,7 @@ class ControlPanel(QMainWindow):
             parts.append(f"<script>\n{script[:8000]}\n</script>")
         if extra_context:
             parts.append(f"<recent_conversation>\n{extra_context}\n</recent_conversation>")
-        parts.append(f"Question: {q}")
+        parts.append(f"Question: {q}" if parts else q)
         user = "\n\n".join(parts)
         grounded = passage is not None
         return self._run_answer_request(system, user, grounded, token)
@@ -2674,13 +2672,20 @@ class ControlPanel(QMainWindow):
             return False
         self._status("Thinking…")
         req = AIRequest(cfg, system, user, 700, self)
-        meta = {"grounded": grounded, "token": token if token is not None else -1}
-        req.succeeded.connect(lambda text, m=meta: self._on_answer(text, m))
+        req.meta = {"grounded": grounded, "token": token if token is not None else -1}
+        req.result.connect(self._on_answer_result)
         req.failed.connect(self._on_ai_failed)
-        req.done.connect(self._answer_requests.discard)
+        req.done.connect(self._on_answer_done)
         self._answer_requests.add(req)
         req.start()
         return True
+
+    def _on_answer_result(self, text, req):
+        self._on_answer(text, getattr(req, "meta", None))
+
+    def _on_answer_done(self, req):
+        self._answer_requests.discard(req)
+        req.deleteLater()
 
     def _on_answer(self, text, meta=None):
         meta = meta or {"grounded": False, "token": -1}
