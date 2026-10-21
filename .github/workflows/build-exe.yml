@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -23,8 +24,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Self-test the app (Python source)
+        timeout-minutes: 8
+        run: python cuepilot.py --selftest --report selftest-source.txt
+
       - name: Build the exe
-        run: pyinstaller --noconfirm --onefile --windowed --name CuePilot --icon cuepilot.ico cuepilot.py
+        run: pyinstaller --noconfirm --onefile --windowed --name CuePilot --icon cuepilot.ico --collect-data soundcard --collect-data docx cuepilot.py
+
+      - name: Self-test the finished exe
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          $report = Join-Path $PWD "selftest-exe.txt"
+          $p = Start-Process -FilePath "dist\CuePilot.exe" -ArgumentList "--selftest","--report","`"$report`"" -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report } else { Write-Host "The exe did not write a report." }
+          exit $p.ExitCode
+
+      - name: Save the test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-reports
+          path: selftest-*.txt
+          if-no-files-found: warn
 
       - name: Save the exe as a download
         uses: actions/upload-artifact@v4
