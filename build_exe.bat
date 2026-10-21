@@ -22,7 +22,7 @@ if errorlevel 1 (
 )
 
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --onefile --windowed ^
-    --name CuePilot --icon cuepilot.ico cuepilot.py
+    --name CuePilot --icon cuepilot.ico --collect-data soundcard --collect-data docx cuepilot.py
 if errorlevel 1 (
     echo The build failed. Scroll up for the error.
     pause
