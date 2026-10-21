@@ -7,7 +7,7 @@ A teleprompter that floats on top of Google Meet, Zoom, Microsoft Teams or any o
 You need Windows 10 or 11 and Python 3.10 or newer (from python.org, with "Add python.exe to PATH" ticked).
 
 1. Put all the files in one folder.
-2. Double-click `run.bat`. The first run installs PySide6 into a local `.venv` folder (about a minute). After that it opens straight away.
+2. Double-click `run.bat`. The first run installs the packages it needs into a local `.venv` folder (a minute or two). After that it opens straight away. Listening mode also needs `soundcard` and `numpy`, which `run.bat` installs for you.
 
 Prefer a single program file? Double-click `build_exe.bat`. It produces `dist\CuePilot.exe` (around 60 to 90 MB, because Qt is bundled inside). Copy it anywhere and run it without Python. Windows SmartScreen may warn that the app is unrecognised, since it isn't code-signed; choose "More info" and then "Run anyway".
 
@@ -46,6 +46,86 @@ What it can do:
 
 API keys are stored in plain text in `%APPDATA%\CuePilot\settings.json`. Untick **Remember key on this PC** to keep the key only for the current session, or leave the key field blank and set the `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` environment variable instead.
 
+## Listen and answer
+
+CuePilot can listen to the call, show a live transcript, flag the questions people ask, and draft an answer for each one on the prompter. Open the **AI assistant** tab and find **Listen and answer** near the bottom.
+
+**Before you use it:** tick the box confirming everyone on the call knows they're being transcribed. Recording or transcribing people without telling them is illegal in some places, including Germany. You're responsible for getting consent, and listening won't start until you confirm it.
+
+Pick how the speech is turned into text:
+
+| Transcription | What you need |
+|---|---|
+| Groq (free, cloud) | A free key from console.groq.com. Fast and accurate. The default. |
+| OpenAI (cloud) | Your OpenAI key. Uses `gpt-4o-mini-transcribe`. |
+| Offline (faster-whisper) | `pip install faster-whisper`. Runs on your PC, so no audio leaves the machine. Needs more processor power and a one-off model download. |
+| Custom | Any server with an `/audio/transcriptions` endpoint. |
+
+The cloud options send the call audio to that service for transcription only. If that's a concern, use the offline option. This transcription key is separate from the AI key you already set up; the AI key still writes the answers.
+
+How to use it:
+
+1. Click **Start listening** (or press Ctrl+Alt+L). The level meter shows it's hearing audio.
+2. What the other person says appears in the transcript box.
+3. A moment after they stop, CuePilot asks your AI whether they asked a question worth answering. Real questions are marked ❓ in amber; small talk, filler and rhetorical questions are ignored.
+4. **Tap a question** to draft an answer, which appears in the answer box above. From there, use **Insert at reading line** or **Add to end** to put it on the prompter.
+5. Or tick **Answer questions automatically** so every detected question gets an answer without a tap.
+
+### How it decides what to answer
+
+CuePilot doesn't just match question marks. A moment after the other person stops talking, it sends the last few lines of their speech to your AI and asks whether there's a real question you're expected to answer. That means it understands indirect questions ("I'd love to hear about your Shield experience"), handles questions spread over several sentences, and skips small talk and rhetorical questions. The trade-off is a small, steady stream of AI calls while you're listening, and a second or two of delay before a question is flagged. This uses the same AI key you set up at the top of the tab, not the transcription key.
+
+Answers use your script plus the recent conversation as context, so a follow-up like "and how does that scale?" is answered against what was just discussed, not in a vacuum.
+
+### Whose voice gets answered
+
+CuePilot only answers the other person, never you. It captures two separate streams: the call audio from your speakers (the other person) and, optionally, your microphone (you). Because it knows which stream each phrase came from, it answers the other person's questions and never your own. Your lines still appear in the transcript, greyed out and prefixed "you", so you can follow the whole conversation.
+
+Tick **Also capture my microphone** when you're on speakers. The other person's voice comes out of your speakers and your mic picks it up, and the call also echoes your own voice back from the far end a moment later. With your mic captured, CuePilot filters those echoes out by matching them against what you just said, so it won't answer your own questions bouncing back.
+
+Headphones give the cleanest separation, because your mic then hears only you and the call audio hears only the other person. On speakers it works well too, with two small limits: if you and the other person talk at the exact same instant, one of their questions can occasionally be filtered as an echo, and the filtering relies on the two transcriptions being similar. If you can wear headphones for important calls, do.
+
+It uses Windows loopback capture, which needs Windows 10 or 11.
+
+## Reference document
+
+Upload a document and CuePilot will show the most relevant passage from it, in your document's own words, whenever the other person asks something. It never paraphrases your material; it only picks which passage to show. Find **Reference document** at the bottom of the **AI assistant** tab.
+
+Supported files: PDF, Word (.docx), and plain text or markdown.
+
+**How it finds the right passage.** Three levels, best first, each falling back to the next:
+
+| Search | Needs | What it does |
+|---|---|---|
+| Contextual | an embeddings key + your AI key | Before matching, it adds a one-line note to each passage saying where it sits in the document, so an isolated paragraph about "throughput under load" still matches a question about "scaling". On by default. |
+| Smart (semantic) | an embeddings key | Matches by meaning, so different words for the same idea still match. |
+| Keyword | nothing | Matches shared words. Free, offline, instant. Always available as a fallback. |
+
+Smart and contextual search use an embeddings API (OpenAI's `text-embedding-3-small` or Gemini's are cheap). Set it under **Smart search** in the document section. The document is embedded once when you upload it, which takes a few seconds; after that each question is one tiny lookup. Contextual search also makes one small call per passage to your main AI when the document loads, to write those context notes. Without an embeddings key, keyword search still works.
+
+How to use it:
+
+1. Click **Upload document** and choose your file.
+2. Wait a moment while it's prepared (keyword search is ready at once; smart search finishes a few seconds later).
+3. When a question is detected, the best-matching passage appears in the box, with its section heading, and goes onto the prompter automatically. Untick **Show the matching passage on the prompter automatically** if you'd rather tap **Show on prompter** yourself.
+
+### Document and AI together
+
+The document and the AI answer work side by side. The prompter shows your document's own exact wording to speak from; the answer box beside it shows a refined AI answer phrased for speaking.
+
+Everything runs in parallel for speed. The instant it detects a question, CuePilot:
+
+1. shows the best keyword passage on the prompter straight away — no network, so it appears in a fraction of a second;
+2. starts the AI answer at the same time, without waiting for the lookup;
+3. runs the smart (semantic) lookup alongside, which upgrades the shown passage a moment later and, if the document has a good match, refines the answer to be grounded in that passage.
+
+CuePilot judges whether the document actually contains the answer:
+
+- **When the document has a good match:** the passage is on the prompter immediately, and the AI answer in the side panel is grounded in your material. The panel notes "Grounded in your document."
+- **When nothing in the document fits:** the document panel says "nothing closely matching," and the AI answers from your script and general knowledge instead, so you still get a usable answer.
+
+So you're reading your own material almost instantly, the answers never wait on each other, and the document is the starting point whenever it has the answer.
+
 ## Writing scripts
 
 - Anything in square brackets, like `[PAUSE]`, `[SMILE]` or `[NEXT SLIDE]`, shows in amber as a stage cue.
@@ -67,11 +147,21 @@ Anywhere in Windows:
 | Ctrl+Alt+H | Show or hide the prompter |
 | Ctrl+Alt+T | Click-through on or off |
 | Ctrl+Alt+A | Jump to the AI question box |
+| Ctrl+Alt+L | Start or stop listening to the call |
 | Ctrl+Alt+P | Open the control panel |
 
 On the prompter itself: Space, arrow keys, Page Up/Down and Home work when it has focus; the mouse wheel scrolls by hand; Ctrl+wheel changes text size; double-click starts or pauses; drag to move, drag an edge to resize, right-click for more options.
 
+## Self-test
+
+`python cuepilot.py --selftest` (or `CuePilot.exe --selftest --report selftest.txt`) opens the real windows and checks around 260 things on its own: drawing, scrolling, every setting and shortcut, click-through, hiding from screen sharing, the AI features, question detection, listening mode and document search against fake servers on your PC, saving files and settings. It uses a temporary folder, so your own script and settings aren't touched, and nothing is sent to the internet.
+
+Each line of the report says PASS, WARN or FAIL. WARN means the check depends on the machine (for example, a build server without a visible screen can't take a real screenshot); FAIL means something in CuePilot is broken. The GitHub workflow runs the self-test on the Python code and again on the finished exe, and stops the build if anything fails. The reports are saved with each run under **Artifacts → selftest-reports**.
+
 ## Troubleshooting
+
+**The app closes straight away or nothing happens.** Look in `%APPDATA%\CuePilot\error.log` and send me what it says.
+
 
 **A shortcut does nothing.** Another program has claimed it. The Shortcuts tab lists any that couldn't be registered. Intel graphics utilities often take Ctrl+Alt+arrow keys (they rotate the screen); turn those hotkeys off in the Intel control panel and restart CuePilot.
 

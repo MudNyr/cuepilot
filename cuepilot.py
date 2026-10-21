@@ -19,13 +19,16 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import datetime
 import html
+import http.client
 import json
 import os
 import re
 import socket
 import sys
 import threading
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,11 +36,21 @@ from functools import reduce
 from operator import or_
 from pathlib import Path
 
+try:
+    import cuepilot_listen as listen
+except Exception:  # pragma: no cover - only if the file is missing
+    listen = None
+
+try:
+    import cuepilot_docs as docs
+except Exception:  # pragma: no cover - only if the file is missing
+    docs = None
+
 from PySide6.QtCore import (QByteArray, QElapsedTimer, QObject, QPoint, QPointF,
                             QRectF, Qt, QTimer, Signal)
 from PySide6.QtGui import (QAbstractTextDocumentLayout, QColor, QFont, QFontMetricsF,
                            QGuiApplication, QIcon, QKeySequence, QPainter, QPainterPath,
-                           QPalette, QPen, QPixmap, QShortcut, QTextBlockFormat,
+                           QPalette, QPen, QPixmap, QShortcut, QTextBlockFormat, QTextCharFormat,
                            QTextCursor, QTextDocument)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
                                QFileDialog, QFontComboBox, QFormLayout, QFrame,
@@ -145,6 +158,7 @@ HOTKEYS = [
     ("toggle_overlay", "Ctrl+Alt+H", _CA | MOD_NOREPEAT, 0x48, "Show or hide the prompter"),
     ("toggle_clickthrough", "Ctrl+Alt+T", _CA | MOD_NOREPEAT, 0x54, "Turn click-through on or off"),
     ("ask", "Ctrl+Alt+A", _CA | MOD_NOREPEAT, 0x41, "Jump to the AI question box"),
+    ("toggle_listen", "Ctrl+Alt+L", _CA | MOD_NOREPEAT, 0x4C, "Start or stop listening to the call"),
     ("show_panel", "Ctrl+Alt+P", _CA | MOD_NOREPEAT, 0x50, "Open the control panel"),
 ]
 
@@ -157,6 +171,7 @@ class GlobalHotkeys(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tid = None
+        self.ready = threading.Event()
 
     def start(self):
         if IS_WINDOWS:
@@ -171,6 +186,7 @@ class GlobalHotkeys(QObject):
             else:
                 failed.append(label)
         self.registered.emit(failed)
+        self.ready.set()
         msg = wintypes.MSG()
         while True:
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -246,6 +262,16 @@ DEFAULTS = {
     "remember_key": True,
     "use_script_context": True,
     "auto_insert_answer": False,
+    "stt_provider": "Groq (free, cloud)",
+    "stt_profiles": {},
+    "capture_mic": False,
+    "auto_answer_questions": False,
+    "listen_consent_ack": False,
+    "doc_path": "",
+    "embed_provider": "OpenAI",
+    "embed_profiles": {},
+    "use_contextual": True,
+    "project_doc_on_question": True,
 }
 
 SAMPLE_SCRIPT = """Good morning, everyone.
@@ -285,6 +311,26 @@ def load_settings() -> dict:
         prof.setdefault("base_url", meta["base_url"])
         prof.setdefault("model", meta["model"])
         prof.setdefault("api_key", "")
+    if not isinstance(s["stt_profiles"], dict):
+        s["stt_profiles"] = {}
+    if listen is not None:
+        for name, meta in listen.STT_PROVIDERS.items():
+            prof = s["stt_profiles"].setdefault(name, {})
+            prof.setdefault("base_url", meta["base_url"])
+            prof.setdefault("model", meta["model"])
+            prof.setdefault("api_key", "")
+        if s["stt_provider"] not in listen.STT_PROVIDERS:
+            s["stt_provider"] = listen.DEFAULT_STT_PROVIDER
+    if not isinstance(s["embed_profiles"], dict):
+        s["embed_profiles"] = {}
+    if docs is not None:
+        for name, meta in docs.EMBED_PROVIDERS.items():
+            prof = s["embed_profiles"].setdefault(name, {})
+            prof.setdefault("base_url", meta["base_url"])
+            prof.setdefault("model", meta["model"])
+            prof.setdefault("api_key", "")
+        if s["embed_provider"] not in docs.EMBED_PROVIDERS:
+            s["embed_provider"] = "OpenAI"
     if s["provider"] not in PROVIDERS:
         s["provider"] = DEFAULT_PROVIDER
     return s
@@ -294,6 +340,10 @@ def save_settings(s: dict) -> None:
     data = copy.deepcopy(s)
     if not data.get("remember_key", True):
         for prof in data["ai_profiles"].values():
+            prof["api_key"] = ""
+        for prof in data.get("stt_profiles", {}).values():
+            prof["api_key"] = ""
+        for prof in data.get("embed_profiles", {}).values():
             prof["api_key"] = ""
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -381,7 +431,29 @@ SYSTEM_ASK = (
     "teleprompter and say it in their own words.\n"
     "Answer in at most 6 short lines, each under 15 words, most important point first.\n"
     "Plain text only: no headings, no markdown, no preamble.\n"
-    "If the speaker's script is provided, stay consistent with it."
+    "If the speaker's script or the recent conversation is provided, stay consistent with it and "
+    "resolve follow-ups like 'and how does that scale?' using that context."
+)
+SYSTEM_GROUNDED = (
+    "You support a speaker during a live video call. They will glance at your answer on a "
+    "teleprompter and say it in their own words.\n"
+    "You are given an extract from the speaker's own reference document that is relevant to the "
+    "question. Base your answer on that extract. Stay faithful to it; do not invent facts it "
+    "doesn't contain. You may add a brief connecting phrase from the script or general knowledge.\n"
+    "Answer in at most 6 short lines, each under 15 words, most important point first.\n"
+    "Plain text only: no headings, no markdown, no preamble."
+)
+SYSTEM_DETECT = (
+    "You watch a live video call on behalf of one participant (the speaker). You are given the "
+    "most recent lines the OTHER people on the call said, in order. Decide whether the latest "
+    "part contains a question or request that the speaker is expected to answer out loud now.\n"
+    "Treat as a question: direct questions, indirect ones ('I'd love to hear about your Shield "
+    "experience'), and requests to explain or walk through something.\n"
+    "Do NOT treat as a question: small talk, rhetorical questions, filler, check-ins like 'can you "
+    "hear me?', or anything already clearly answered.\n"
+    "Reply with a single JSON object and nothing else: {\"question\": \"...\"} with the question "
+    "phrased clearly and self-contained (resolve pronouns using the context), or {\"question\": null} "
+    "if there is nothing to answer. Output only the JSON."
 )
 LENGTHS = {"30 seconds": 75, "1 minute": 140, "2 minutes": 280, "3 minutes": 420,
            "5 minutes": 700, "10 minutes": 1400}
@@ -434,6 +506,10 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: float):
                            "Check your internet connection and the server URL.") from None
     except json.JSONDecodeError:
         raise RuntimeError("The AI service sent a reply that isn't JSON. Check the server URL.") from None
+    except (OSError, http.client.HTTPException) as exc:
+        host = urllib.parse.urlsplit(url).netloc or url
+        raise RuntimeError(f"The connection to {host} dropped ({exc.__class__.__name__}). "
+                           "Try again.") from None
 
 
 def ai_complete(cfg: dict, system: str, user: str, max_tokens: int = 1500,
@@ -491,12 +567,50 @@ class AIRequest(QObject):
             self.done.emit(self)
 
 
+class ListenerBridge(QObject):
+    """The listener runs on background threads; these signals hop safely onto the GUI thread."""
+    transcript = Signal(str, bool, str)   # text, is_question, speaker
+    status = Signal(str, bool)       # message, is_error
+    level = Signal(float)            # 0..1 input loudness
+
+
+class DocBridge(QObject):
+    """Signals from the document background workers onto the GUI thread."""
+    loaded = Signal(int, str)            # passage count, message
+    load_failed = Signal(str)
+    embed_progress = Signal(int, int, str)
+    embed_done = Signal(bool, str)       # contextual?, message
+    embed_failed = Signal(str)
+    search_result = Signal(str, str, str, str)  # question, meta, heading, text
+    search_empty = Signal(str)           # question
+
+
+class DocWorker(threading.Thread):
+    """Runs one document job (load, embed, or search) on a daemon thread."""
+
+    def __init__(self, fn, parent_set):
+        super().__init__(name="cuepilot-doc", daemon=True)
+        self._fn = fn
+        self._set = parent_set
+        self._set.add(self)
+
+    def run(self):
+        try:
+            self._fn()
+        finally:
+            self._set.discard(self)
+
+
 # =============================================================================
 # The overlay prompter
 # =============================================================================
 ICON_FONTS = ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
 GLYPH = {"play": "\uE768", "pause": "\uE769", "top": "\uE892", "up": "\uE70E", "down": "\uE70D",
          "smaller": "\uE8E7", "bigger": "\uE8E8", "settings": "\uE713", "close": "\uE711"}
+
+
+def _enum_int(value) -> int:
+    return int(value.value) if hasattr(value, "value") else int(value)
 
 
 def make_timer(parent, ms, slot, single=True) -> QTimer:
@@ -907,12 +1021,13 @@ class PrompterOverlay(QWidget):
         e.accept()
 
     def keyPressEvent(self, e):
-        k, K = e.key(), Qt.Key
+        K = Qt.Key
         actions = {K.Key_Space: self.toggle_play, K.Key_Up: self.faster, K.Key_Down: self.slower,
                    K.Key_PageUp: lambda: self.jump(-1), K.Key_PageDown: lambda: self.jump(1),
                    K.Key_Home: self.restart, K.Key_Plus: self.bigger, K.Key_Equal: self.bigger,
                    K.Key_Minus: self.smaller, K.Key_Escape: lambda: self.set_playing(False)}
-        fn = actions.get(k)
+        actions = {_enum_int(key): fn for key, fn in actions.items()}
+        fn = actions.get(_enum_int(e.key()))
         if fn is None:
             super().keyPressEvent(e)
             return
@@ -1063,6 +1178,10 @@ class ControlPanel(QMainWindow):
         self.s = settings
         self.ov = overlay
         self._requests = set()
+        self._answer_requests = set()
+        self._answer_token = 0
+        self._shown_answer_grounded = False
+        self._shown_answer_token = None
         self._busy = False
         self._pending = None
         self._loading_profile = False
@@ -1072,7 +1191,8 @@ class ControlPanel(QMainWindow):
         self.setWindowTitle(f"{APP_NAME}: teleprompter for video calls")
         self.setWindowIcon(make_icon())
         self.setStyleSheet(PANEL_QSS)
-        self.resize(1140, 760)
+        avail = QGuiApplication.primaryScreen().availableGeometry()
+        self.resize(min(1140, avail.width() - 40), min(760, avail.height() - 40))
         if self.s.get("panel_geometry"):
             try:
                 self.restoreGeometry(QByteArray.fromBase64(self.s["panel_geometry"].encode()))
@@ -1233,19 +1353,20 @@ class ControlPanel(QMainWindow):
         size_row.layout().setContentsMargins(0, 0, 0, 0)
         form.addRow("Size", size_row)
 
-        align = QComboBox()
-        align.addItems(["Left", "Centre"])
-        align.setCurrentText("Centre" if self.s["align"] in ("Center", "Centre") else "Left")
-        align.currentTextChanged.connect(lambda t: self._set("align", t, rebuild=True))
-        spacing = QSpinBox()
-        spacing.setRange(100, 250)
-        spacing.setSingleStep(10)
-        spacing.setSuffix(" %")
-        spacing.setValue(int(self.s["line_spacing"]))
-        spacing.valueChanged.connect(
+        self.align_combo = QComboBox()
+        self.align_combo.addItems(["Left", "Centre"])
+        self.align_combo.setCurrentText("Centre" if self.s["align"] in ("Center", "Centre") else "Left")
+        self.align_combo.currentTextChanged.connect(lambda t: self._set("align", t, rebuild=True))
+        self.spacing_spin = QSpinBox()
+        self.spacing_spin.setRange(100, 250)
+        self.spacing_spin.setSingleStep(10)
+        self.spacing_spin.setSuffix(" %")
+        self.spacing_spin.setValue(int(self.s["line_spacing"]))
+        self.spacing_spin.valueChanged.connect(
             lambda val: self._set("line_spacing", val, rebuild=True, keep_ratio=True))
         align_row = QWidget()
-        align_row.setLayout(hrow(align, label("Line spacing", "hint"), spacing, stretch_last=True))
+        align_row.setLayout(hrow(self.align_combo, label("Line spacing", "hint"), self.spacing_spin,
+                                 stretch_last=True))
         align_row.layout().setContentsMargins(0, 0, 0, 0)
         form.addRow("Alignment", align_row)
 
@@ -1256,15 +1377,16 @@ class ControlPanel(QMainWindow):
         colours.layout().setContentsMargins(0, 0, 0, 0)
         form.addRow("Text colour", colours)
 
-        box, _, _ = self._slider("bg_opacity", 0, 100, lambda x: f"{x} %",
-                                 lambda x: self._set("bg_opacity", x))
+        box, self.opacity_slider, _ = self._slider("bg_opacity", 0, 100, lambda x: f"{x} %",
+                                                   lambda x: self._set("bg_opacity", x))
         form.addRow("Background", box)
-        margin = QSpinBox()
-        margin.setRange(0, 200)
-        margin.setSuffix(" px")
-        margin.setValue(int(self.s["margin"]))
-        margin.valueChanged.connect(lambda val: self._set("margin", val, rebuild=True, keep_ratio=True))
-        form.addRow("Side margin", margin)
+        self.margin_spin = QSpinBox()
+        self.margin_spin.setRange(0, 200)
+        self.margin_spin.setSuffix(" px")
+        self.margin_spin.setValue(int(self.s["margin"]))
+        self.margin_spin.valueChanged.connect(
+            lambda val: self._set("margin", val, rebuild=True, keep_ratio=True))
+        form.addRow("Side margin", self.margin_spin)
         v.addLayout(form)
 
         v.addWidget(label("Scrolling", "section"))
@@ -1274,17 +1396,17 @@ class ControlPanel(QMainWindow):
         box, self.speed_slider, self.speed_val = self._slider(
             "speed", 5, 400, lambda x: f"{x}", self._on_speed)
         form2.addRow("Speed", box)
-        guide_chk = QCheckBox("Show a reading line")
-        guide_chk.setChecked(bool(self.s["guide_enabled"]))
-        guide_chk.toggled.connect(lambda on: self._set("guide_enabled", on))
-        form2.addRow("", guide_chk)
-        box, _, _ = self._slider("guide_pos", 10, 80, lambda x: f"{x} %",
-                                 lambda x: self._set("guide_pos", x))
+        self.guide_chk = QCheckBox("Show a reading line")
+        self.guide_chk.setChecked(bool(self.s["guide_enabled"]))
+        self.guide_chk.toggled.connect(lambda on: self._set("guide_enabled", on))
+        form2.addRow("", self.guide_chk)
+        box, self.guide_slider, _ = self._slider("guide_pos", 10, 80, lambda x: f"{x} %",
+                                                 lambda x: self._set("guide_pos", x))
         form2.addRow("Reading line at", box)
-        mirror = QCheckBox("Mirror the text (for a glass teleprompter)")
-        mirror.setChecked(bool(self.s["mirror"]))
-        mirror.toggled.connect(lambda on: self._set("mirror", on))
-        form2.addRow("", mirror)
+        self.mirror_chk = QCheckBox("Mirror the text (for a glass teleprompter)")
+        self.mirror_chk.setChecked(bool(self.s["mirror"]))
+        self.mirror_chk.toggled.connect(lambda on: self._set("mirror", on))
+        form2.addRow("", self.mirror_chk)
         v.addLayout(form2)
 
         v.addWidget(label("During the call", "section"))
@@ -1375,9 +1497,9 @@ class ControlPanel(QMainWindow):
         v.addWidget(label("Ask during the call", "section"))
         self.ask_edit = QLineEdit()
         self.ask_edit.setPlaceholderText("Type a question and press Enter. Ctrl+Alt+A jumps here.")
-        self.ask_edit.returnPressed.connect(self._ask)
+        self.ask_edit.returnPressed.connect(self._ask_clicked)
         self.ask_btn = QPushButton("Ask")
-        self.ask_btn.clicked.connect(self._ask)
+        self.ask_btn.clicked.connect(self._ask_clicked)
         v.addLayout(hrow(self.ask_edit, self.ask_btn))
         self.context_chk = QCheckBox("Use my script as context")
         self.context_chk.setChecked(bool(self.s["use_script_context"]))
@@ -1402,6 +1524,9 @@ class ControlPanel(QMainWindow):
 
         self.ai_status = label("", "hint", wrap=True)
         v.addWidget(self.ai_status)
+
+        self._build_listen_section(v)
+        self._build_doc_section(v)
         v.addStretch(1)
 
         # load the saved provider profile, then start listening for edits
@@ -1413,6 +1538,724 @@ class ControlPanel(QMainWindow):
         for edit in (self.url_edit, self.key_edit, self.model_edit):
             edit.textChanged.connect(self._store_profile)
         return w
+
+    # ------------------------------------------------------------ listen UI
+    def _build_listen_section(self, v):
+        self.listener = None
+        self._loading_stt = False
+        self._current_stt = self.s["stt_provider"]
+
+        v.addWidget(label("Listen and answer", "section"))
+        if listen is None:
+            v.addWidget(label("Listening mode isn't available in this build.", "hint", wrap=True))
+            self.listen_btn = QPushButton("Start listening")
+            self.listen_btn.setEnabled(False)
+            v.addWidget(self.listen_btn)
+            return
+
+        v.addWidget(label("CuePilot listens to the call, shows what's said, and flags questions "
+                          "so you can answer them with one tap.", "hint", wrap=True))
+
+        self.consent_chk = QCheckBox("Everyone on the call knows it's being transcribed")
+        self.consent_chk.setChecked(bool(self.s["listen_consent_ack"]))
+        self.consent_chk.toggled.connect(self._on_consent)
+        v.addWidget(self.consent_chk)
+        v.addWidget(label("Recording or transcribing people without telling them is illegal in some "
+                          "places. You're responsible for getting consent.", "hint", wrap=True))
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(8)
+        self.stt_combo = QComboBox()
+        self.stt_combo.addItems(list(listen.STT_PROVIDERS))
+        self.stt_url = QLineEdit()
+        self.stt_key = QLineEdit()
+        self.stt_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.stt_key.setPlaceholderText("Paste your transcription API key")
+        self.stt_model = QLineEdit()
+        form.addRow("Transcribe with", self.stt_combo)
+        form.addRow("Server URL", self.stt_url)
+        form.addRow("API key", self.stt_key)
+        form.addRow("Model", self.stt_model)
+        v.addLayout(form)
+        self.stt_hint = label("", "hint", wrap=True)
+        v.addWidget(self.stt_hint)
+
+        self.mic_chk = QCheckBox("Also capture my microphone (shown greyed out, never answered)")
+        self.mic_chk.setChecked(bool(self.s["capture_mic"]))
+        self.mic_chk.toggled.connect(lambda on: self.s.__setitem__("capture_mic", on))
+        self.mic_chk.setToolTip("CuePilot only answers the other person. Your microphone is used to "
+                                "show your own lines and to filter your voice echoing back through "
+                                "your speakers; it's never answered.")
+        v.addWidget(self.mic_chk)
+        self.auto_answer_chk = QCheckBox("Answer questions automatically as they're heard")
+        self.auto_answer_chk.setChecked(bool(self.s["auto_answer_questions"]))
+        self.auto_answer_chk.toggled.connect(lambda on: self.s.__setitem__("auto_answer_questions", on))
+        v.addWidget(self.auto_answer_chk)
+        v.addWidget(label("Otherwise, tap a question below to answer it.", "hint"))
+
+        self.listen_btn = QPushButton("Start listening")
+        self.listen_btn.setObjectName("primary")
+        self.listen_btn.clicked.connect(self._toggle_listen)
+        self.listen_level = QLabel("")
+        self.listen_level.setMinimumWidth(90)
+        self.listen_level.setToolTip("Input loudness")
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear_transcript)
+        v.addLayout(hrow(self.listen_btn, self.listen_level, None, clear_btn))
+
+        v.addWidget(label("Heard on the call (tap a question to answer it):", "hint"))
+        self.transcript_box = QPlainTextEdit()
+        self.transcript_box.setReadOnly(True)
+        self.transcript_box.setPlaceholderText("What people say appears here. Questions are marked ❓.")
+        self.transcript_box.setMaximumHeight(130)
+        self.transcript_box.setMouseTracking(True)
+        self.transcript_box.mousePressEvent = self._transcript_clicked
+        v.addWidget(self.transcript_box)
+        self.listen_status = label("", "hint", wrap=True)
+        v.addWidget(self.listen_status)
+
+        self._questions = []     # list of (line_text, question_text)
+        self._history = []       # list of (who, text), who in ("them", "you")
+        self._detect_buffer = []  # far-end lines awaiting an AI question check
+        self.bridge = ListenerBridge(self)
+        self.bridge.transcript.connect(self._on_transcript)
+        self.bridge.status.connect(self._on_listen_status)
+        self.bridge.level.connect(self._on_listen_level)
+        self._level_timer = make_timer(self, 120, self._fade_level, single=False)
+        # Fires ~1.6 s after the other person stops, then asks the AI if there's a question.
+        self._detect_timer = make_timer(self, 1600, self._run_detection, single=True)
+        self._detect_requests = set()
+
+        self._loading_stt = True
+        self.stt_combo.setCurrentText(self._current_stt)
+        self._load_stt_profile(self._current_stt)
+        self._loading_stt = False
+        self.stt_combo.currentTextChanged.connect(self._on_stt_provider_changed)
+        for edit in (self.stt_url, self.stt_key, self.stt_model):
+            edit.textChanged.connect(self._store_stt_profile)
+
+    def _load_stt_profile(self, name):
+        prof = self.s["stt_profiles"].get(name, {})
+        meta = listen.STT_PROVIDERS[name]
+        self.stt_url.setText(prof.get("base_url", meta["base_url"]))
+        self.stt_key.setText(prof.get("api_key", ""))
+        self.stt_model.setText(prof.get("model", meta["model"]))
+        local = meta["kind"] == "local"
+        self.stt_url.setEnabled(not local)
+        self.stt_key.setEnabled(not local)
+        self.stt_key.setPlaceholderText("Not needed" if local or not meta["needs_key"]
+                                        else "Paste your transcription API key")
+        self.stt_hint.setText(meta["hint"])
+
+    def _store_stt_profile(self, *_):
+        if self._loading_stt:
+            return
+        self.s["stt_profiles"][self._current_stt] = {
+            "base_url": self.stt_url.text().strip(),
+            "api_key": self.stt_key.text().strip(),
+            "model": self.stt_model.text().strip(),
+        }
+
+    def _on_stt_provider_changed(self, name):
+        self._store_stt_profile()
+        self._current_stt = name
+        self.s["stt_provider"] = name
+        self._loading_stt = True
+        self._load_stt_profile(name)
+        self._loading_stt = False
+
+    def _on_consent(self, on):
+        self.s["listen_consent_ack"] = on
+        if not on and self.listener is not None:
+            self._stop_listen()
+
+    def _toggle_listen(self):
+        if self.listener is not None:
+            self._stop_listen()
+        else:
+            self._start_listen()
+
+    def _start_listen(self):
+        if not self.consent_chk.isChecked():
+            self._set_listen_status("Confirm everyone on the call knows they're being transcribed "
+                                    "before you start.", error=True)
+            self.consent_chk.setFocus()
+            return
+        ok, msg = listen.capture_available()
+        if not ok:
+            self._set_listen_status(msg, error=True)
+            return
+        cfg, err = listen.build_stt_config(self._current_stt, self.stt_url.text(), self.stt_key.text(),
+                                           self.stt_model.text())
+        if err:
+            self._set_listen_status(err, error=True)
+            return
+        try:
+            self.listener = listen.Listener(
+                cfg,
+                on_transcript=lambda t, q, spk: self.bridge.transcript.emit(t, q, spk),
+                on_status=lambda m, e: self.bridge.status.emit(m, e),
+                on_level=lambda lv: self.bridge.level.emit(lv),
+                capture_mic=self.mic_chk.isChecked(),
+                suppress_echo=True)
+            self.listener.start()
+        except Exception as exc:
+            self.listener = None
+            self._set_listen_status(f"Couldn't start listening: {exc}", error=True)
+            return
+        self.listen_btn.setText("Stop listening")
+        self.listen_btn.setProperty("live", "true")
+        self._restyle(self.listen_btn)
+        self._level_timer.start()
+        if self.mic_chk.isChecked():
+            self._set_listen_status("Listening. CuePilot answers only the other person; your own "
+                                    "voice is shown greyed out. On speakers, headphones give the "
+                                    "cleanest separation.")
+        else:
+            self._set_listen_status("Listening to the other person. Turn on 'capture my microphone' "
+                                    "if your own voice leaks in and you want it filtered out.")
+        self.statusBar().showMessage("Listening. Only the other person's questions are answered.", 6000)
+
+    def _stop_listen(self):
+        if self.listener is not None:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
+            self.listener = None
+        self.listen_btn.setText("Start listening")
+        self.listen_btn.setProperty("live", "false")
+        self._restyle(self.listen_btn)
+        self._level_timer.stop()
+        self._detect_timer.stop()
+        self._detect_buffer = []
+        self.listen_level.setText("")
+        self._set_listen_status("Stopped listening.")
+
+    def _restyle(self, widget):
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _set_listen_status(self, msg, error=False):
+        self.listen_status.setStyleSheet(f"color: {TALLY};" if error else f"color: {MUTED};")
+        self.listen_status.setText(msg)
+
+    def _on_listen_status(self, msg, error):
+        self._set_listen_status(msg, error)
+        if error:
+            self.statusBar().showMessage(msg, 8000)
+
+    def _on_listen_level(self, level):
+        self._last_level = max(getattr(self, "_last_level", 0.0), level)
+
+    def _fade_level(self):
+        lv = getattr(self, "_last_level", 0.0)
+        bars = min(10, int(lv * 120))
+        self.listen_level.setText("▮" * bars + "▯" * (10 - bars) if self.listener else "")
+        self._last_level = lv * 0.5
+
+    def _on_transcript(self, text, is_question, speaker=None):
+        if listen is not None and speaker == listen.ME:
+            # Your own voice: show it greyed out, never answer it.
+            self._append_transcript_line(f"you:  {text}", mine=True)
+            self._history.append(("you", text))
+            self._trim_history()
+            return
+        prefix = "them: " if (listen is not None and self.mic_chk.isChecked()) else ""
+        # The quick rules give an instant hint; the AI confirms a beat later.
+        mark = "• " if is_question else ""
+        line = f"{mark}{prefix}{text}"
+        self._append_transcript_line(line, mine=False)
+        self._history.append(("them", text))
+        self._trim_history()
+        # Buffer the far-end line and schedule an AI check shortly after they stop talking.
+        self._detect_buffer.append(text)
+        self._detect_timer.start()
+
+    def _trim_history(self):
+        if len(self._history) > 40:
+            self._history = self._history[-40:]
+
+    def _recent_context(self, limit=12):
+        rows = self._history[-limit:]
+        return "\n".join(f"{'You' if who == 'you' else 'Them'}: {t}" for who, t in rows)
+
+    def _run_detection(self):
+        """Ask the AI whether the recent far-end lines contain a question to answer."""
+        if listen is None or self.listener is None or not self._detect_buffer:
+            return
+        recent = self._history[-10:]
+        if not recent:
+            return
+        self._detect_buffer = []
+        convo = "\n".join(f"{'You' if who == 'you' else 'Them'}: {t}" for who, t in recent)
+        cfg, err = self._ai_config()
+        if err:
+            self._set_listen_status("Listening, but question detection needs the AI set up: " + err,
+                                    error=True)
+            return
+        user = ("Recent lines from the call (most recent last):\n" + convo
+                + "\n\nIs there a question the speaker should answer now?")
+        req = AIRequest(cfg, SYSTEM_DETECT, user, 200, self)
+        req.succeeded.connect(self._on_detection)
+        req.failed.connect(lambda msg: None)  # a failed detection is silent; the next line retries
+        req.done.connect(self._detect_requests.discard)
+        self._detect_requests.add(req)
+        req.start()
+
+    def _on_detection(self, reply):
+        question = self._parse_detected_question(reply)
+        if not question:
+            return
+        if self._is_duplicate_question(question):
+            return
+        marker = "❓ "
+        line = marker + question
+        self._append_transcript_line(line, mine=False, question=True)
+        self._questions.append((line, question))
+        if self.auto_answer_chk.isChecked():
+            self._handle_question(question, auto=True)
+        else:
+            # Still surface the document passage so it's ready when they tap.
+            if docs is not None and getattr(self, "ref_doc", None) is not None:
+                self.search_document(question, answer_after=False)
+            self._set_listen_status(f"Question from the other person. Tap it above to answer: "
+                                    f"{question[:60]}")
+
+    @staticmethod
+    def _parse_detected_question(reply):
+        import json as _json
+        import re as _re
+        if not reply:
+            return None
+        m = _re.search(r"\{.*\}", reply, _re.DOTALL)
+        if m:
+            try:
+                data = _json.loads(m.group(0))
+                q = data.get("question")
+                if isinstance(q, str) and q.strip() and q.strip().lower() not in ("null", "none"):
+                    return q.strip()
+                return None
+            except Exception:
+                pass
+        # Fall back: treat a short plain reply that isn't a refusal as the question.
+        low = reply.strip().lower()
+        if low in ("null", "none", "no", "{}", '{"question": null}'):
+            return None
+        return reply.strip()[:300] if "?" in reply else None
+
+    def _is_duplicate_question(self, question):
+        ql = question.lower().strip()
+        for _line, prev in self._questions[-4:]:
+            if listen is not None and listen.text_similarity(prev, question) >= 0.8:
+                return True
+            if prev.lower().strip() == ql:
+                return True
+        return False
+
+    def _append_transcript_line(self, line, mine=False, question=False):
+        cursor = self.transcript_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        if question:
+            fmt.setForeground(QColor(AMBER))
+        else:
+            fmt.setForeground(QColor(MUTED) if mine else QColor(self.s["text_color"]))
+        if self.transcript_box.document().characterCount() > 1:
+            cursor.insertBlock()
+        cursor.setCharFormat(fmt)
+        cursor.insertText(line)
+        self.transcript_box.setTextCursor(cursor)
+        bar = self.transcript_box.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _append_transcript_line(self, line, mine=False):
+        cursor = self.transcript_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(MUTED) if mine else QColor(self.s["text_color"]))
+        if self.transcript_box.document().characterCount() > 1:
+            cursor.insertBlock()
+        cursor.setCharFormat(fmt)
+        cursor.insertText(line)
+        self.transcript_box.setTextCursor(cursor)
+        bar = self.transcript_box.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _transcript_clicked(self, event):
+        QPlainTextEdit.mousePressEvent(self.transcript_box, event)
+        cursor = self.transcript_box.cursorForPosition(event.pos())
+        clicked = cursor.block().text()
+        for line, question in self._questions:
+            if line == clicked:
+                self._answer_question(question)
+                return
+
+    def _answer_question(self, question):
+        self._handle_question(question, auto=True)
+
+    def _handle_question(self, question, auto=True):
+        """Answer as fast as possible: fire everything at once.
+          1. Show the instant keyword passage on the prompter (no network).
+          2. Start the AI answer straight away (the slow part), not waiting for the lookup.
+          3. Start the semantic document lookup in parallel; when it lands it upgrades the
+             shown passage and, if it's a good match, triggers one grounded refinement."""
+        self.ask_edit.setText(question)
+        self._answer_token = getattr(self, "_answer_token", 0) + 1
+        token = self._answer_token
+        has_doc = docs is not None and getattr(self, "ref_doc", None) is not None
+
+        if has_doc:
+            # instant, offline keyword pass — the prompter never waits for the network
+            self._instant_doc_pass(question)
+            # semantic refine in parallel (may upgrade the passage and ground the answer)
+            self.search_document(question, answer_after=True, token=token)
+
+        # fire the AI answer immediately, in parallel with the lookup
+        self._ask_grounded(question, passage=self._current_good_passage(), token=token)
+
+    def _current_good_passage(self):
+        return getattr(self, "_last_doc_result", None)
+
+    def _instant_doc_pass(self, question):
+        if self.ref_doc is None or docs is None:
+            return
+        try:
+            results = self.ref_doc.search_keyword(question, top_k=1)
+        except Exception:
+            results = []
+        if results and results[0].get("good"):
+            r = results[0]
+            self._show_doc_passage(question, r["heading"], r["text"], "keyword", project=True)
+        else:
+            self._last_doc_result = None
+
+    def _ask_grounded(self, question, passage=None, token=None):
+        """Ask the AI, grounding the answer in a document passage when one is given."""
+        context = self._recent_context() if self._history else ""
+        self.ask_edit.setText(question)
+        if self._ask(extra_context=context, passage=passage, token=token):
+            where = "from your document" if passage else "from the script"
+            self._set_listen_status(f"Answering ({where}): {question[:50]}")
+
+    def _clear_transcript(self):
+        self.transcript_box.clear()
+        self._questions = []
+        self._history = []
+        self._detect_buffer = []
+
+    # ------------------------------------------------------------ reference doc UI
+    def _build_doc_section(self, v):
+        self.ref_doc = None
+        self._doc_workers = set()
+        self._embed_stop = False
+        self._last_doc_result = None
+
+        v.addWidget(label("Reference document", "section"))
+        if docs is None:
+            v.addWidget(label("Document search isn't available in this build.", "hint", wrap=True))
+            return
+        v.addWidget(label("Upload a document (PDF, Word, or text). When the other person asks "
+                          "something, CuePilot shows the most relevant passage from it, in your "
+                          "document's own words.", "hint", wrap=True))
+
+        self.doc_name_lbl = label("No document loaded.", "hint", wrap=True)
+        load_btn = QPushButton("Upload document…")
+        load_btn.clicked.connect(self._load_document)
+        unload_btn = QPushButton("Remove")
+        unload_btn.clicked.connect(self._unload_document)
+        v.addLayout(hrow(load_btn, unload_btn, None))
+        v.addWidget(self.doc_name_lbl)
+
+        self.contextual_chk = QCheckBox("Smart search: match by meaning, not just keywords "
+                                        "(needs an embeddings key)")
+        self.contextual_chk.setChecked(bool(self.s["use_contextual"]))
+        self.contextual_chk.toggled.connect(self._on_contextual_toggled)
+        v.addWidget(self.contextual_chk)
+
+        self.embed_box = QWidget()
+        eb = QVBoxLayout(self.embed_box)
+        eb.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(8)
+        self.embed_combo = QComboBox()
+        self.embed_combo.addItems(list(docs.EMBED_PROVIDERS))
+        self.embed_url = QLineEdit()
+        self.embed_key = QLineEdit()
+        self.embed_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.embed_key.setPlaceholderText("Paste your embeddings API key")
+        self.embed_model = QLineEdit()
+        form.addRow("Embeddings", self.embed_combo)
+        form.addRow("Server URL", self.embed_url)
+        form.addRow("API key", self.embed_key)
+        form.addRow("Model", self.embed_model)
+        eb.addLayout(form)
+        eb.addWidget(label("Smart search embeds your document once when you upload it. Contextual "
+                           "search (on by default) also adds a one-line context note to each "
+                           "passage using your main AI, which improves matching. Without an "
+                           "embeddings key, search still works by keywords.", "hint", wrap=True))
+        v.addWidget(self.embed_box)
+
+        self.project_doc_chk = QCheckBox("Show the matching passage on the prompter automatically")
+        self.project_doc_chk.setChecked(bool(self.s["project_doc_on_question"]))
+        self.project_doc_chk.toggled.connect(lambda on: self.s.__setitem__("project_doc_on_question", on))
+        v.addWidget(self.project_doc_chk)
+
+        v.addWidget(label("Most relevant passage:", "hint"))
+        self.doc_result = QPlainTextEdit()
+        self.doc_result.setReadOnly(True)
+        self.doc_result.setPlaceholderText("When a question is detected, the best-matching passage "
+                                           "from your document appears here.")
+        self.doc_result.setMaximumHeight(150)
+        v.addWidget(self.doc_result)
+        show_btn = QPushButton("Show on prompter")
+        show_btn.clicked.connect(self._project_doc_result)
+        append_btn = QPushButton("Add to script")
+        append_btn.clicked.connect(self._append_doc_result)
+        self.doc_status = label("", "hint", wrap=True)
+        v.addLayout(hrow(show_btn, append_btn, None))
+        v.addWidget(self.doc_status)
+
+        self.doc_bridge = DocBridge(self)
+        self.doc_bridge.loaded.connect(self._on_doc_loaded)
+        self.doc_bridge.load_failed.connect(self._on_doc_failed)
+        self.doc_bridge.embed_progress.connect(self._on_embed_progress)
+        self.doc_bridge.embed_done.connect(self._on_embed_done)
+        self.doc_bridge.embed_failed.connect(self._on_embed_failed)
+        self.doc_bridge.search_result.connect(self._on_doc_search_result)
+        self.doc_bridge.search_empty.connect(self._on_doc_search_empty_answer)
+        self._pending_answer = None
+
+        self._loading_embed = True
+        self._current_embed = self.s["embed_provider"]
+        self.embed_combo.setCurrentText(self._current_embed)
+        self._load_embed_profile(self._current_embed)
+        self._loading_embed = False
+        self.embed_combo.currentTextChanged.connect(self._on_embed_provider_changed)
+        for edit in (self.embed_url, self.embed_key, self.embed_model):
+            edit.textChanged.connect(self._store_embed_profile)
+        self.embed_box.setVisible(self.contextual_chk.isChecked())
+
+        if self.s.get("doc_path") and Path(self.s["doc_path"]).exists():
+            QTimer.singleShot(400, lambda: self._load_document(self.s["doc_path"]))
+
+    def _load_embed_profile(self, name):
+        prof = self.s["embed_profiles"].get(name, {})
+        meta = docs.EMBED_PROVIDERS[name]
+        self.embed_url.setText(prof.get("base_url", meta["base_url"]))
+        self.embed_key.setText(prof.get("api_key", ""))
+        self.embed_model.setText(prof.get("model", meta["model"]))
+
+    def _store_embed_profile(self, *_):
+        if getattr(self, "_loading_embed", False):
+            return
+        self.s["embed_profiles"][self._current_embed] = {
+            "base_url": self.embed_url.text().strip(),
+            "api_key": self.embed_key.text().strip(),
+            "model": self.embed_model.text().strip(),
+        }
+
+    def _on_embed_provider_changed(self, name):
+        self._store_embed_profile()
+        self._current_embed = name
+        self.s["embed_provider"] = name
+        self._loading_embed = True
+        self._load_embed_profile(name)
+        self._loading_embed = False
+
+    def _on_contextual_toggled(self, on):
+        self.s["use_contextual"] = on
+        self.embed_box.setVisible(on)
+        if on and self.ref_doc is not None and not self.ref_doc.embedded:
+            self._embed_document()
+
+    def _embed_config(self):
+        return docs.build_embed_config(self._current_embed, self.embed_url.text(),
+                                       self.embed_key.text(), self.embed_model.text())
+
+    def _load_document(self, path=None):
+        if not path:
+            start = str(Path(self.s.get("doc_path") or Path.home()).parent)
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Choose a reference document", start,
+                "Documents (*.pdf *.docx *.txt *.md);;All files (*)")
+        if not path:
+            return
+        self.doc_name_lbl.setText(f"Loading {Path(path).name}…")
+
+        def job():
+            try:
+                text = docs.read_document(path)
+                doc = docs.ReferenceDoc(Path(path).name)
+                count = doc.load_text(text)
+                self.ref_doc = doc
+                self.s["doc_path"] = path
+                self.doc_bridge.loaded.emit(count, Path(path).name)
+            except docs.DocError as exc:
+                self.doc_bridge.load_failed.emit(str(exc))
+            except Exception as exc:
+                self.doc_bridge.load_failed.emit(f"Couldn't read the document: {exc}")
+        DocWorker(job, self._doc_workers).start()
+
+    def _on_doc_loaded(self, count, name):
+        self.doc_name_lbl.setText(f"{name} — {count} passage(s), keyword search ready.")
+        self.doc_status.setText("")
+        if self.contextual_chk.isChecked():
+            self._embed_document()
+
+    def _on_doc_failed(self, msg):
+        self.ref_doc = None
+        self.doc_name_lbl.setText("No document loaded.")
+        self.doc_status.setStyleSheet(f"color: {TALLY};")
+        self.doc_status.setText(msg)
+
+    def _unload_document(self):
+        self._embed_stop = True
+        self.ref_doc = None
+        self.s["doc_path"] = ""
+        self.doc_name_lbl.setText("No document loaded.")
+        self.doc_result.clear()
+        self.doc_status.setText("")
+
+    def _embed_document(self):
+        if self.ref_doc is None or docs is None:
+            return
+        cfg, err = self._embed_config()
+        if err:
+            self.doc_status.setStyleSheet(f"color: {MUTED};")
+            self.doc_status.setText("Using keyword search. For smart search, " + err[0].lower() + err[1:])
+            return
+        context_ai = None
+        if self.contextual_chk.isChecked():
+            ai_cfg, ai_err = self._ai_config()
+            if not ai_err:
+                context_ai = {"complete": lambda sysm, usr, mx: ai_complete(ai_cfg, sysm, usr, mx)}
+        self._embed_stop = False
+        self.doc_status.setStyleSheet(f"color: {MUTED};")
+        self.doc_status.setText("Preparing smart search…")
+        doc = self.ref_doc
+
+        def job():
+            try:
+                doc.build_embeddings(
+                    cfg, context_ai=context_ai,
+                    on_progress=lambda i, n, phase: self.doc_bridge.embed_progress.emit(i, n, phase),
+                    should_stop=lambda: self._embed_stop or self.ref_doc is not doc)
+                if self.ref_doc is doc and doc.embedded:
+                    self.doc_bridge.embed_done.emit(doc.contextual, "")
+            except docs.DocError as exc:
+                self.doc_bridge.embed_failed.emit(str(exc))
+            except Exception as exc:
+                self.doc_bridge.embed_failed.emit(f"Smart search setup failed: {exc}")
+        DocWorker(job, self._doc_workers).start()
+
+    def _on_embed_progress(self, i, n, phase):
+        if phase == "preparing" and n:
+            self.doc_status.setText(f"Preparing smart search… passage {i} of {n}")
+        elif phase == "embedding":
+            self.doc_status.setText("Finishing smart search…")
+
+    def _on_embed_done(self, contextual, _msg):
+        kind = "contextual" if contextual else "semantic"
+        self.doc_status.setStyleSheet(f"color: {MUTED};")
+        self.doc_status.setText(f"Smart search ready ({kind} matching).")
+
+    def _on_embed_failed(self, msg):
+        self.doc_status.setStyleSheet(f"color: {TALLY};")
+        self.doc_status.setText(msg + " Falling back to keyword search.")
+
+    def search_document(self, question, answer_after=False, token=None):
+        """Semantic document lookup on a worker thread, in parallel with the AI answer. When it
+        returns it upgrades the shown passage and, if answer_after and the match is good, triggers
+        one grounded refinement of the answer."""
+        if self.ref_doc is None or docs is None or not question.strip():
+            return
+        doc = self.ref_doc
+        cfg = None
+        if doc.embedded:
+            cfg, _err = self._embed_config()
+        if cfg is None:
+            return  # no embeddings: the instant keyword pass already did the work
+
+        def job():
+            try:
+                results = doc.search_semantic(question, cfg, top_k=1)
+            except Exception:
+                return  # keep the keyword result already shown
+            if self.ref_doc is not doc or not results:
+                return
+            r = results[0]
+            good = "good" if r.get("good") else "weak"
+            after = "answer" if answer_after else "noanswer"
+            # pack metadata and the passage separately so text can contain anything
+            meta = f"{r['method']}|{good}|{after}|{token or 0}"
+            self.doc_bridge.search_result.emit(question, meta, r["heading"], r["text"])
+        DocWorker(job, self._doc_workers).start()
+
+    def _show_doc_passage(self, question, heading, text, method, project):
+        self._last_doc_result = (heading, text)
+        shown = (f"[{heading}]\n{text}" if heading else text)
+        self.doc_result.setPlainText(shown)
+        label_method = {"contextual": "smart", "semantic": "smart",
+                        "keyword": "keyword"}.get(method, method)
+        self.doc_status.setStyleSheet(f"color: {MUTED};")
+        self.doc_status.setText(f"Passage found by {label_method} search for: {question[:50]}")
+        if project and self.project_doc_chk.isChecked():
+            self._project_doc_result()
+
+    def _on_doc_search_result(self, question, meta, heading, text):
+        method, good_flag, after, token = (meta.split("|") + ["", "", "", "0"])[:4]
+        good = good_flag == "good"
+        if good:
+            # Upgrade the shown passage to the semantic match (may differ from the keyword one).
+            self._show_doc_passage(question, heading, text, method, project=True)
+        elif getattr(self, "_last_doc_result", None) is None:
+            # Neither keyword nor semantic found anything good.
+            self.doc_result.setPlainText("")
+            self.doc_status.setStyleSheet(f"color: {MUTED};")
+            self.doc_status.setText("Nothing closely matching in the document. The AI answer is "
+                                    "from the script instead.")
+        # Grounded refinement: only when this is still the current question and the match is good.
+        if after == "answer" and good and str(getattr(self, "_answer_token", 0)) == token:
+            self._ask_grounded(question, passage=self._last_doc_result, token=int(token))
+
+    def _on_doc_search_empty_answer(self, question):
+        if getattr(self, "_last_doc_result", None) is None:
+            self.doc_result.setPlainText("")
+            self.doc_status.setText("Nothing matching in the document.")
+
+    def _project_doc_result(self):
+        if not self._last_doc_result:
+            return
+        heading, text = self._last_doc_result
+        block = (f"[FROM: {heading}]\n{text}\n[END]" if heading else f"[REFERENCE]\n{text}\n[END]")
+        self._push_text()
+        line_idx = self.ov.reading_line_index()
+        block_doc = self.editor.document().findBlockByNumber(line_idx)
+        cur = QTextCursor(block_doc) if block_doc.isValid() else QTextCursor(self.editor.document())
+        if block_doc.isValid():
+            cur.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        else:
+            cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.beginEditBlock()
+        cur.insertText("\n\n" + block + "\n")
+        cur.endEditBlock()
+        self._push_text()
+        self._set_listen_status("Reference passage added to the prompter at the reading line.")
+
+    def _append_doc_result(self):
+        if not self._last_doc_result:
+            return
+        heading, text = self._last_doc_result
+        block = (f"[FROM: {heading}]\n{text}\n[END]" if heading else f"[REFERENCE]\n{text}\n[END]")
+        cur = QTextCursor(self.editor.document())
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        cur.beginEditBlock()
+        cur.insertText("\n\n" + block)
+        cur.endEditBlock()
+        self._push_text()
 
     def _build_shortcuts_tab(self) -> QWidget:
         w = QWidget()
@@ -1556,8 +2399,10 @@ class ControlPanel(QMainWindow):
         start_dir = str(Path(self.s["last_file"]).parent) if self.s["last_file"] else str(Path.home())
         path, _ = QFileDialog.getOpenFileName(self, "Open a script", start_dir,
                                               "Text files (*.txt *.md);;All files (*)")
-        if not path:
-            return
+        if path:
+            self._load_path(path)
+
+    def _load_path(self, path):
         try:
             text = Path(path).read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
@@ -1614,6 +2459,7 @@ class ControlPanel(QMainWindow):
             "toggle_clickthrough": lambda: self.click_chk.setChecked(not self.click_chk.isChecked()),
             "show_panel": self.bring_to_front,
             "ask": self._focus_ask,
+            "toggle_listen": self._hotkey_listen,
         }
         fn = actions.get(name)
         if fn:
@@ -1635,6 +2481,12 @@ class ControlPanel(QMainWindow):
         self.tabs.setCurrentWidget(self.ai_tab)
         self.ask_edit.setFocus()
         self.ask_edit.selectAll()
+
+    def _hotkey_listen(self):
+        if listen is None or not hasattr(self, "listen_btn") or not self.listen_btn.isEnabled():
+            return
+        self.tabs.setCurrentWidget(self.ai_tab)
+        self._toggle_listen()
 
     # ------------------------------------------------------------------ AI
     def _load_profile(self, name):
@@ -1780,24 +2632,77 @@ class ControlPanel(QMainWindow):
         self._replace_editor_text(text, start, end)
         self._status("Rewritten. Ctrl+Z in the editor undoes it.")
 
-    def _ask(self):
+    def _ask_clicked(self):
         q = self.ask_edit.text().strip()
         if not q:
             self.ask_edit.setFocus()
             return
-        script = self.editor.toPlainText().strip()
-        user = q
-        if self.context_chk.isChecked() and script:
-            user = f"<script>\n{script[:8000]}\n</script>\n\nQuestion: {q}"
-        self._run_ai(SYSTEM_ASK, user, self._on_answer, "Thinking", max_tokens=700)
+        if docs is not None and getattr(self, "ref_doc", None) is not None:
+            self._handle_question(q, auto=True)
+        else:
+            self._ask()
 
-    def _on_answer(self, text):
+    def _ask(self, extra_context="", passage=None, token=None):
+        q = self.ask_edit.text().strip()
+        if not q:
+            self.ask_edit.setFocus()
+            return False
+        script = self.editor.toPlainText().strip()
+        parts = []
+        system = SYSTEM_ASK
+        if passage:
+            heading, text = passage
+            label = f"{heading}\n{text}" if heading else text
+            parts.append(f"<document_extract>\n{label}\n</document_extract>")
+            system = SYSTEM_GROUNDED
+        if self.context_chk.isChecked() and script:
+            parts.append(f"<script>\n{script[:8000]}\n</script>")
+        if extra_context:
+            parts.append(f"<recent_conversation>\n{extra_context}\n</recent_conversation>")
+        parts.append(f"Question: {q}")
+        user = "\n\n".join(parts)
+        grounded = passage is not None
+        return self._run_answer_request(system, user, grounded, token)
+
+    def _run_answer_request(self, system, user, grounded, token):
+        """Answer requests can run in parallel (a quick plain one and a grounded upgrade), so they
+        don't go through the single-slot _run_ai. A grounded answer always wins over a plain one
+        for the same question; a plain one never overwrites a grounded one."""
+        cfg, err = self._ai_config()
+        if err:
+            self._status(err, error=True)
+            return False
+        self._status("Thinking…")
+        req = AIRequest(cfg, system, user, 700, self)
+        meta = {"grounded": grounded, "token": token if token is not None else -1}
+        req.succeeded.connect(lambda text, m=meta: self._on_answer(text, m))
+        req.failed.connect(self._on_ai_failed)
+        req.done.connect(self._answer_requests.discard)
+        self._answer_requests.add(req)
+        req.start()
+        return True
+
+    def _on_answer(self, text, meta=None):
+        meta = meta or {"grounded": False, "token": -1}
+        token = meta.get("token", -1)
+        grounded = meta.get("grounded", False)
+        current = getattr(self, "_answer_token", 0)
+        # Drop answers for an older question.
+        if token not in (-1, current):
+            return
+        # A plain answer must not overwrite a grounded one already shown for this question.
+        if token == current and not grounded and getattr(self, "_shown_answer_grounded", False) \
+                and getattr(self, "_shown_answer_token", None) == token:
+            return
+        self._shown_answer_grounded = grounded
+        self._shown_answer_token = token
+        note = "Grounded in your document. " if grounded else ""
         self.answer_box.setPlainText(clean_ai_text(text))
         if self.auto_chk.isChecked():
             self._insert_answer_at_reading_line()
-            self._status("Answer added below the reading line.")
+            self._status(note + "Answer added below the reading line.")
         else:
-            self._status("Answer ready. Insert it at the reading line to see it on the prompter.")
+            self._status(note + "Answer ready in the side panel.")
 
     def _answer_block(self):
         ans = self.answer_box.toPlainText().strip()
@@ -1836,7 +2741,18 @@ class ControlPanel(QMainWindow):
         QTimer.singleShot(0, self._apply_capture_to_panel)
 
     def closeEvent(self, e):
+        if getattr(self, "listener", None) is not None:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
+            self.listener = None
+        self._embed_stop = True
         self._store_profile()
+        if hasattr(self, "stt_combo"):
+            self._store_stt_profile()
+        if hasattr(self, "embed_combo"):
+            self._store_embed_profile()
         self._push_text()
         g = self.ov.geometry()
         self.s["overlay_geometry"] = [g.x(), g.y(), g.width(), g.height()]
@@ -1878,7 +2794,24 @@ def place_overlay(overlay: PrompterOverlay, settings: dict):
     overlay.setGeometry(g.center().x() - w // 2, g.top() + 6, w, 230)
 
 
-def main():
+def install_crash_log():
+    """With pythonw or the windowed exe there is no console, so errors go to a log file."""
+    def hook(exc_type, exc, tb):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CONFIG_DIR / "error.log", "a", encoding="utf-8") as f:
+                f.write(f"\n--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ---\n")
+                f.write("".join(traceback.format_exception(exc_type, exc, tb)))
+        except Exception:
+            pass
+        try:
+            sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
+def create_app(argv):
     if IS_WINDOWS:
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CuePilot.Teleprompter")
@@ -1886,7 +2819,7 @@ def main():
             pass
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
-    app = QApplication(sys.argv)
+    app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     apply_dark_palette(app)
@@ -1906,7 +2839,20 @@ def main():
     if settings.get("overlay_visible", True):
         overlay.show()
     panel._on_overlay_visibility(overlay.isVisible())
+    return app, settings, overlay, panel, hotkeys
 
+
+def main():
+    if "--selftest" in sys.argv:
+        import cuepilot_selftest
+        code = cuepilot_selftest.run(sys.modules[__name__], sys.argv)
+        try:
+            sys.stdout and sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(code)  # skip Qt teardown so the exit code is exactly the test result
+    install_crash_log()
+    app, _settings, _overlay, _panel, hotkeys = create_app(sys.argv)
     rc = app.exec()
     hotkeys.stop()
     sys.exit(rc)
