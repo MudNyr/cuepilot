@@ -26,7 +26,17 @@ jobs:
 
       - name: Self-test the app (Python source)
         timeout-minutes: 8
-        run: python cuepilot.py --selftest --report selftest-source.txt
+        shell: pwsh
+        run: |
+          python cuepilot.py --selftest --report selftest-source.txt
+          $code = $LASTEXITCODE
+          # The report is the source of truth; the process exit code is only shown for diagnosis.
+          if (-not (Test-Path selftest-source.txt)) { Write-Host "No report was written (exit code $code)."; exit 1 }
+          $summary = Get-Content selftest-source.txt | Where-Object { $_ -match 'passed, .* failed' } | Select-Object -Last 1
+          Write-Host "Summary: $summary (process exit code $code)"
+          if ($summary -match '(\d+) passed, .* (\d+) failed' -and [int]$Matches[1] -gt 0 -and [int]$Matches[2] -eq 0) { exit 0 }
+          Write-Host "Self-test reported failures. Download selftest-reports to see them."
+          exit 1
 
       - name: Build the exe
         run: pyinstaller --noconfirm --onefile --windowed --name CuePilot --icon cuepilot.ico --collect-data soundcard --collect-data docx cuepilot.py
@@ -37,8 +47,14 @@ jobs:
         run: |
           $report = Join-Path $PWD "selftest-exe.txt"
           $p = Start-Process -FilePath "dist\CuePilot.exe" -ArgumentList "--selftest","--report","`"$report`"" -Wait -PassThru
-          if (Test-Path $report) { Get-Content $report } else { Write-Host "The exe did not write a report." }
-          exit $p.ExitCode
+          $code = $p.ExitCode
+          if (-not (Test-Path $report)) { Write-Host "The exe did not write a report (exit code $code)."; exit 1 }
+          Get-Content $report
+          $summary = Get-Content $report | Where-Object { $_ -match 'passed, .* failed' } | Select-Object -Last 1
+          Write-Host "Summary: $summary (process exit code $code)"
+          if ($summary -match '(\d+) passed, .* (\d+) failed' -and [int]$Matches[1] -gt 0 -and [int]$Matches[2] -eq 0) { exit 0 }
+          Write-Host "The exe self-test reported failures. Download selftest-reports to see them."
+          exit 1
 
       - name: Save the test reports
         if: always()
