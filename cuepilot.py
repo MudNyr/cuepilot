@@ -46,6 +46,11 @@ try:
 except Exception:  # pragma: no cover - only if the file is missing
     docs = None
 
+try:
+    import cuepilot_google as gcp
+except Exception:  # pragma: no cover - only if the file is missing
+    gcp = None
+
 from PySide6.QtCore import (QByteArray, QElapsedTimer, QObject, QPoint, QPointF,
                             QRectF, Qt, QTimer, Signal)
 from PySide6.QtGui import (QAbstractTextDocumentLayout, QColor, QFont, QFontMetricsF,
@@ -215,6 +220,13 @@ PROVIDERS = {
         "env": "ANTHROPIC_API_KEY", "needs_key": True,
         "hint": "Get a key at console.anthropic.com. Leave the key blank to use the "
                 "ANTHROPIC_API_KEY environment variable. For faster answers try claude-haiku-5-5."},
+    "Claude on Google Cloud (Vertex AI)": {
+        "kind": "vertex", "base_url": "", "model": "claude-sonnet-5-5", "env": "",
+        "needs_key": False,
+        "hint": "Uses your Google sign-in instead of a key. One-time setup: install the Google Cloud "
+                "CLI and run 'gcloud auth application-default login'. In Google Cloud, enable the "
+                "Vertex AI API and enable Claude in Model Garden, then copy the exact model ID "
+                "from there. Region 'global' is cheapest and works for recent models."},
     "OpenAI": {
         "kind": "openai", "base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini",
         "env": "OPENAI_API_KEY", "needs_key": True,
@@ -311,6 +323,8 @@ def load_settings() -> dict:
         prof.setdefault("base_url", meta["base_url"])
         prof.setdefault("model", meta["model"])
         prof.setdefault("api_key", "")
+        prof.setdefault("project", "")
+        prof.setdefault("region", "global")
     if not isinstance(s["stt_profiles"], dict):
         s["stt_profiles"] = {}
     if listen is not None:
@@ -516,7 +530,14 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: float):
 
 def ai_complete(cfg: dict, system: str, user: str, max_tokens: int = 1500,
                 timeout: float = 120) -> str:
-    base = cfg["base_url"].strip().rstrip("/")
+    if cfg.get("kind") == "vertex":
+        if gcp is None:
+            raise RuntimeError("Google Cloud support isn't available in this build.")
+        return gcp.vertex_complete(cfg, system, user, max_tokens, timeout)
+    base = re.sub(r"/vi(?=/|$)", "/v1", cfg["base_url"].strip().rstrip("/"), flags=re.IGNORECASE)
+    for suffix in ("/chat/completions", "/messages"):
+        if base.lower().endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
     headers = {"Content-Type": "application/json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"}
     if cfg["kind"] == "anthropic":
         if base.endswith("/v1"):
@@ -1450,10 +1471,17 @@ class ControlPanel(QMainWindow):
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit.setPlaceholderText("Paste your API key")
         self.model_edit = QLineEdit()
+        self.project_edit = QLineEdit()
+        self.project_edit.setPlaceholderText("Your Google Cloud project ID, e.g. my-project-123")
+        self.region_edit = QLineEdit()
+        self.region_edit.setPlaceholderText("global")
         form.addRow("Provider", self.provider_combo)
         form.addRow("Server URL", self.url_edit)
         form.addRow("API key", self.key_edit)
+        form.addRow("Project ID", self.project_edit)
+        form.addRow("Region", self.region_edit)
         form.addRow("Model", self.model_edit)
+        self.ai_form = form
         v.addLayout(form)
         self.provider_hint = label("", "hint", wrap=True)
         v.addWidget(self.provider_hint)
@@ -1541,7 +1569,8 @@ class ControlPanel(QMainWindow):
         self._load_profile(self._current_provider)
         self._loading_profile = False
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
-        for edit in (self.url_edit, self.key_edit, self.model_edit):
+        for edit in (self.url_edit, self.key_edit, self.model_edit, self.project_edit,
+                     self.region_edit):
             edit.textChanged.connect(self._store_profile)
         return w
 
@@ -1587,7 +1616,7 @@ class ControlPanel(QMainWindow):
         self.stt_hint = label("", "hint", wrap=True)
         v.addWidget(self.stt_hint)
 
-        self.mic_chk = QCheckBox("Also capture my microphone (shown greyed out, never answered)")
+        self.mic_chk = QCheckBox("Also capture my microphone (optional; usually leave this off)")
         self.mic_chk.setChecked(bool(self.s["capture_mic"]))
         self.mic_chk.toggled.connect(lambda on: self.s.__setitem__("capture_mic", on))
         self.mic_chk.setToolTip("CuePilot only answers the other person. Your microphone is used to "
@@ -1698,6 +1727,8 @@ class ControlPanel(QMainWindow):
         if err:
             self._set_listen_status(err, error=True)
             return
+        if cfg.get("base_url") and cfg["base_url"] != self.stt_url.text().strip():
+            self.stt_url.setText(cfg["base_url"])  # show the tidied address; it's saved too
         try:
             self.listener = listen.Listener(
                 cfg,
@@ -1822,16 +1853,24 @@ class ControlPanel(QMainWindow):
         self._detect_requests.add(req)
         req.start()
 
-    def _on_detection_failed(self, _msg):
-        pass  # a failed detection is silent; the next far-end line retries
+    def _on_detection_failed(self, msg):
+        """Show why Claude couldn't check for questions (at most every 20 s for the same error)."""
+        import time as _time
+        now = _time.monotonic()
+        if msg != getattr(self, "_last_detect_err", None) or now - getattr(self, "_last_detect_err_t", 0.0) > 20:
+            self._last_detect_err, self._last_detect_err_t = msg, now
+            self._set_listen_status(f"Claude couldn't check for questions: {msg}", error=True)
+            self.statusBar().showMessage(f"Question check failed: {msg}", 10000)
 
     def _on_detection_done(self, req):
         self._detect_requests.discard(req)
         req.deleteLater()
 
     def _on_detection(self, reply):
+        self._last_detect_err = None
         question = self._parse_detected_question(reply)
         if not question:
+            self._set_listen_status("Claude checked what was just said: no question to answer.")
             return
         if self._is_duplicate_question(question):
             return
@@ -2507,9 +2546,18 @@ class ControlPanel(QMainWindow):
         self.url_edit.setText(prof.get("base_url", ""))
         self.key_edit.setText(prof.get("api_key", ""))
         self.model_edit.setText(prof.get("model", ""))
+        self.project_edit.setText(prof.get("project", ""))
+        self.region_edit.setText(prof.get("region", "global") or "global")
         meta = PROVIDERS[name]
         self.key_edit.setPlaceholderText("Paste your API key" if meta["needs_key"] else "Not needed")
         self.provider_hint.setText(meta["hint"])
+        vertex = meta["kind"] == "vertex"
+        for widget, show in ((self.url_edit, not vertex), (self.key_edit, not vertex),
+                             (self.project_edit, vertex), (self.region_edit, vertex)):
+            try:
+                self.ai_form.setRowVisible(widget, show)
+            except Exception:  # very old Qt: fall back to hiding just the field
+                widget.setVisible(show)
 
     def _store_profile(self, *_):
         if self._loading_profile:
@@ -2518,6 +2566,8 @@ class ControlPanel(QMainWindow):
             "base_url": self.url_edit.text().strip(),
             "api_key": self.key_edit.text().strip(),
             "model": self.model_edit.text().strip(),
+            "project": self.project_edit.text().strip(),
+            "region": self.region_edit.text().strip() or "global",
         }
 
     def _on_provider_changed(self, name):
@@ -2531,6 +2581,18 @@ class ControlPanel(QMainWindow):
     def _ai_config(self):
         name = self._current_provider
         meta = PROVIDERS[name]
+        if meta["kind"] == "vertex":
+            if gcp is None:
+                return None, "Google Cloud support isn't available in this build."
+            project = self.project_edit.text().strip()
+            model = self.model_edit.text().strip()
+            if not project:
+                return None, "Enter your Google Cloud project ID."
+            if not model:
+                return None, "Enter the Claude model ID from Vertex AI Model Garden."
+            return {"kind": "vertex", "project": project, "model": model,
+                    "region": self.region_edit.text().strip() or "global", "base_url": "",
+                    "api_key": ""}, None
         url = self.url_edit.text().strip()
         model = self.model_edit.text().strip()
         key = self.key_edit.text().strip()

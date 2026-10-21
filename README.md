@@ -36,6 +36,15 @@ Open the **AI assistant** tab and choose a provider:
 | Ollama (local, free) | Install Ollama, run `ollama pull llama3.2`. No key, works offline. |
 | Custom | Any OpenAI-compatible server (LM Studio, Groq, OpenRouter...). Enter its base URL, usually ending in `/v1`. |
 
+**Claude on Google Cloud (Vertex AI).** If you'd rather use Claude through Google Cloud, pick **Claude on Google Cloud (Vertex AI)**. Google Cloud doesn't use API keys for this; it uses your Google sign-in (called Application Default Credentials). One-time setup:
+
+1. Install the Google Cloud CLI from cloud.google.com/sdk/docs/install.
+2. Open Command Prompt and run `gcloud auth application-default login`, then sign in in the browser window that opens.
+3. In the Google Cloud console, choose your project, enable the **Vertex AI API**, then open **Model Garden**, search for Claude, and enable the model you want. This needs a billing account on the project.
+4. In CuePilot, enter your **Project ID**, leave **Region** as `global`, and paste the exact **model ID** shown in Model Garden. Click **Test connection**.
+
+CuePilot refreshes the sign-in automatically. If it ever expires, run the `gcloud auth application-default login` command again.
+
 Model names change over time, so check your provider's documentation if a model isn't found. Press **Test connection** to check everything works.
 
 What it can do:
@@ -81,9 +90,9 @@ Answers use your script plus the recent conversation as context, so a follow-up 
 
 CuePilot only answers the other person, never you. It captures two separate streams: the call audio from your speakers (the other person) and, optionally, your microphone (you). Because it knows which stream each phrase came from, it answers the other person's questions and never your own. Your lines still appear in the transcript, greyed out and prefixed "you", so you can follow the whole conversation.
 
-Tick **Also capture my microphone** when you're on speakers. The other person's voice comes out of your speakers and your mic picks it up, and the call also echoes your own voice back from the far end a moment later. With your mic captured, CuePilot filters those echoes out by matching them against what you just said, so it won't answer your own questions bouncing back.
+**Also capture my microphone** is optional, and you can usually leave it off. CuePilot hears the other person straight from your speakers, so it doesn't need your mic to work. Turn it on only if you want your own lines in the transcript, or if your own voice keeps showing up as the other person (some calls echo you back).
 
-Headphones give the cleanest separation, because your mic then hears only you and the call audio hears only the other person. On speakers it works well too, with two small limits: if you and the other person talk at the exact same instant, one of their questions can occasionally be filtered as an echo, and the filtering relies on the two transcriptions being similar. If you can wear headphones for important calls, do.
+On speakers with the mic on, the mic also overhears the other person. CuePilot recognises that from the timing: the overheard copy arrives at the same moment as the speakers' copy, so it's dropped and the question is still answered. Your own voice echoed back by a call arrives later, after a network delay, so that copy is the one dropped. Headphones avoid the overlap entirely.
 
 It uses Windows loopback capture, which needs Windows 10 or 11.
 

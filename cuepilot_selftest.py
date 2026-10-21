@@ -65,10 +65,11 @@ def start_mock_server(cp, delay=0.25):
             if headers.get("user-agent", "").startswith("Python-urllib"):
                 self._send(403, {"error": {"message": "generic Python client blocked"}})
                 return
-            if self.path.endswith("/v1/messages"):
+            if self.path.endswith("/v1/messages") or self.path.endswith(":rawPredict"):
                 system = body.get("system", "")
                 user = body["messages"][0]["content"]
-                key = headers.get("x-api-key", "")
+                key = headers.get("x-api-key", "") or headers.get("authorization", "").replace(
+                    "Bearer ", "")
             elif self.path.endswith("/chat/completions"):
                 msgs = body.get("messages", [])
                 system = msgs[0]["content"] if msgs else ""
@@ -109,7 +110,7 @@ def start_mock_server(cp, delay=0.25):
                 text = GROUNDED_REPLY
             else:
                 text = "Unexpected request"
-            if self.path.endswith("/v1/messages"):
+            if self.path.endswith("/v1/messages") or self.path.endswith(":rawPredict"):
                 self._send(200, {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
             else:
                 self._send(200, {"choices": [{"message": {"role": "assistant", "content": text}}]})
@@ -1004,7 +1005,58 @@ class SelfTest:
         p.test_btn.click()
         self.ai_wait()
         self.check("Ollama works without a key", p.ai_status.text().startswith("Connected"), p.ai_status.text())
+
+        # Claude on Google Cloud (Vertex AI): Google sign-in instead of a key
+        gcp = getattr(cp, "gcp", None)
+        if gcp is None:
+            self.log(FAIL, "Google Cloud module failed to import", "cuepilot_google.py missing")
+        else:
+            real_url, real_token = gcp.vertex_url, gcp.access_token
+            gcp.vertex_url = lambda project, region, model, base_override=None: (
+                f"{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/"
+                f"{model}:rawPredict")
+            gcp.access_token = lambda force_refresh=False: ("vertex-token", None)
+            try:
+                self.set_provider("Claude on Google Cloud (Vertex AI)")
+                self.check("Google Cloud shows project and region instead of URL and key",
+                           not p.project_edit.isHidden() and not p.region_edit.isHidden()
+                           and p.url_edit.isHidden() and p.key_edit.isHidden())
+                self.check("region defaults to global", p.region_edit.text() == "global",
+                           p.region_edit.text())
+                p.project_edit.setText("")
+                p.test_btn.click()
+                self.pump()
+                self.check("a missing project ID is explained", "project ID" in p.ai_status.text(),
+                           p.ai_status.text())
+                p.project_edit.setText("my-proj")
+                p.model_edit.setText("claude-test")
+                p.test_btn.click()
+                self.ai_wait()
+                self.check("Claude on Google Cloud connects", p.ai_status.text().startswith("Connected"),
+                           p.ai_status.text())
+                if log:
+                    last = log[-1]
+                    self.check("the request goes to Vertex's Claude address with the model in the URL",
+                               last["path"].endswith("/projects/my-proj/locations/global/publishers/"
+                                                     "anthropic/models/claude-test:rawPredict"),
+                               last["path"])
+                    self.check("the Google sign-in token is sent",
+                               last["headers"].get("authorization") == "Bearer vertex-token")
+                    self.check("the body uses Vertex's version and has no model field",
+                               last["body"].get("anthropic_version") == "vertex-2023-10-16"
+                               and "model" not in last["body"], f"{sorted(last['body'])}")
+                p.ask_edit.setText("Quick Vertex check")
+                p.ask_btn.click()
+                self.ai_wait()
+                self.check("Ask works through Google Cloud", p.answer_box.toPlainText() == ASK_REPLY,
+                           p.answer_box.toPlainText())
+                self.check("the project ID is saved with the provider",
+                           s["ai_profiles"]["Claude on Google Cloud (Vertex AI)"]["project"] == "my-proj")
+            finally:
+                gcp.vertex_url, gcp.access_token = real_url, real_token
         self.set_provider("Anthropic (Claude)")
+        self.check("switching back shows the URL and key fields again",
+                   not p.url_edit.isHidden() and not p.key_edit.isHidden() and p.project_edit.isHidden())
 
     def t_listen(self):
         import importlib
@@ -1083,38 +1135,47 @@ class SelfTest:
                        not ef.is_echo("what is our quarterly target", now=110.0))
 
             # end to end through the real Listener with transcription stubbed out
-            events = []
-            lis = listen.Listener({"kind": "cloud", "base_url": "http://x/v1", "api_key": "k",
-                                   "model": "m"},
-                                  on_transcript=lambda t, q, spk: events.append((spk, q, t)),
-                                  on_status=lambda m, e: None, capture_mic=True, suppress_echo=True)
-            texts = {}
+            def run_listener(scenario):
+                """scenario: (label, text, phrase end offset in seconds)."""
+                events = []
+                lis = listen.Listener({"kind": "cloud", "base_url": "http://x/v1", "api_key": "k",
+                                       "model": "m"},
+                                      on_transcript=lambda t, q, spk: events.append((spk, q, t)),
+                                      on_status=lambda m, e: None, capture_mic=True,
+                                      suppress_echo=True)
+                texts = {}
+                lis._transcribe_one = lambda wav: texts.get(id(wav), "")
+                lis._worker = threading.Thread(target=lis._transcribe_loop, daemon=True)
+                lis._worker.start()
+                base = time.monotonic()
+                for label, text, end_off in scenario:
+                    wav = listen.samples_to_wav([0.1] * 160)
+                    texts[id(wav)] = text
+                    with lis._queue_lock:
+                        lis._queue.append((label, wav, base + end_off))
+                    lis._wake.set()
+                    time.sleep(0.05)
+                time.sleep(listen.Listener.ME_HOLD + 0.7)
+                lis.stop()
+                time.sleep(0.4)
+                return events
 
-            def enqueue(label, text):
-                wav = listen.samples_to_wav([0.1] * 1600)
-                texts[id(wav)] = text
-                with lis._queue_lock:
-                    lis._queue.append((label, wav))
-                lis._wake.set()
-            lis._transcribe_one = lambda wav: texts.get(id(wav), "")
-            lis._worker = threading.Thread(target=lis._transcribe_loop, daemon=True)
-            lis._worker.start()
-            enqueue(listen.ME, "what is our revenue target")
-            if not self.wait_for(lambda: len(events) >= 1, 2):
-                pass
-            enqueue(listen.THEM, "what is our revenue target")       # your voice echoing back
-            enqueue(listen.THEM, "can you walk me through the design")  # a real far-end question
-            self.wait_for(lambda: any(e[0] == listen.THEM and e[1] for e in events), 3)
-            time.sleep(0.2)
-            lis.stop()
-            them_q = [e for e in events if e[0] == listen.THEM and e[1]]
-            me_lines = [e for e in events if e[0] == listen.ME]
-            echoed = [e for e in events if e[0] == listen.THEM and e[2] == "what is our revenue target"]
-            self.check("your own line is reported as yours", len(me_lines) == 1, f"{me_lines}")
-            self.check("your voice echoing back through the call is dropped", echoed == [], f"{echoed}")
-            self.check("a real far-end question still comes through and is flagged",
-                       len(them_q) == 1 and them_q[0][2] == "can you walk me through the design",
-                       f"{them_q}")
+            q = "What is your experience with Shield Platform Encryption?"
+            ev = run_listener([(listen.ME, q, 0.05), (listen.THEM, q, 0.0)])
+            self.check("on speakers, a question the mic also overhears is still answered",
+                       ev == [(listen.THEM, True, q)], f"{ev}")
+            ev = run_listener([(listen.ME, "experience with Shield Platform Encryption", 0.1),
+                               (listen.THEM, q, 0.0)])
+            self.check("a partial overheard copy in the mic is ignored",
+                       ev == [(listen.THEM, True, q)], f"{ev}")
+            mine = "What is our revenue target for this quarter?"
+            ev = run_listener([(listen.ME, mine, 0.0), (listen.THEM, mine, 0.6)])
+            self.check("your own voice echoed back by the call is dropped and shown as yours",
+                       ev == [(listen.ME, False, mine)], f"{ev}")
+            ans = "My experience with Shield is about four years across Health Cloud projects."
+            ev = run_listener([(listen.THEM, q, 0.0), (listen.ME, ans, 4.5)])
+            self.check("a question and your later answer are both kept",
+                       ev == [(listen.THEM, True, q), (listen.ME, False, ans)], f"{ev}")
 
         with self.step("Listening: transcription request"):
             srv, base, log = start_mock_transcribe_server()
