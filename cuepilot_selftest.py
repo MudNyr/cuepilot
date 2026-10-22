@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
-SELFTEST_BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
+SELFTEST_BUILD = "2026.10.21-8"  # must match APP_BUILD in cuepilot.py
 IS_WIN = sys.platform == "win32"
 
 SCRIPT_REPLY = "```\n# Opening\nHello team.\n\nThis is the **drafted** script. [PAUSE]\n```"
@@ -1582,7 +1582,12 @@ class SelfTest:
                                not p.embed_project.isHidden() and p.embed_key.isHidden()
                                and p.embed_url.isHidden())
                     self.check("it reuses the project ID set up for Claude on Google Cloud",
-                               p.embed_project.text() == "my-proj", p.embed_project.text())
+                               p.embed_project.text() == "my-proj", repr(p.embed_project.text()))
+                    p.embed_project.setText("")
+                    ecfg, eerr = p._embed_config()
+                    self.check("an empty project box is filled from Claude on Google Cloud when needed",
+                               eerr is None and ecfg.get("project") == "my-proj"
+                               and p.embed_project.text() == "my-proj", f"{eerr} {ecfg}")
                 finally:
                     gcp.vertex_embed_url, gcp.access_token = real_url, real_token
                     vsrv.shutdown()

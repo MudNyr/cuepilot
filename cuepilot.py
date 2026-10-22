@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
 
 APP_NAME = "CuePilot"
 APP_VERSION = "1.0"
-APP_BUILD = "2026.10.21-7"  # all CuePilot files must carry the same build
+APP_BUILD = "2026.10.21-8"  # all CuePilot files must carry the same build
 IS_WINDOWS = sys.platform == "win32"
 
 # Palette: a studio control room. Slate surfaces, an amber cue light, a red tally for "live".
@@ -2126,7 +2126,7 @@ class ControlPanel(QMainWindow):
         vertex = meta.get("kind") == "vertex"
         project = prof.get("project", "")
         if vertex and not project:  # reuse the project already set up for Claude on Google Cloud
-            project = self.s["ai_profiles"].get("Claude on Google Cloud (Vertex AI)", {}).get("project", "")
+            project = self._vertex_ai_project()
         self.embed_project.setText(project)
         self.embed_region.setText(prof.get("region", "") or meta.get("region", ""))
         for widget, show in ((self.embed_url, not vertex), (self.embed_key, not vertex),
@@ -2161,7 +2161,22 @@ class ControlPanel(QMainWindow):
         if on and self.ref_doc is not None and not self.ref_doc.embedded:
             self._embed_document()
 
+    def _vertex_ai_project(self):
+        return self.s["ai_profiles"].get("Claude on Google Cloud (Vertex AI)", {}).get("project", "")
+
+    def _share_google_project(self, project):
+        """Document search on Google Cloud uses the same project as Claude on Google Cloud.
+        Fill its project box if it's empty, whichever one you set up first."""
+        if not project or not hasattr(self, "embed_project") or docs is None:
+            return
+        if docs.EMBED_PROVIDERS.get(self._current_embed, {}).get("kind") == "vertex" \
+                and not self.embed_project.text().strip():
+            self.embed_project.setText(project)
+
     def _embed_config(self):
+        if docs.EMBED_PROVIDERS.get(self._current_embed, {}).get("kind") == "vertex" \
+                and not self.embed_project.text().strip():
+            self._share_google_project(self._vertex_ai_project())
         return docs.build_embed_config(self._current_embed, self.embed_url.text(),
                                        self.embed_key.text(), self.embed_model.text(),
                                        self.embed_project.text(), self.embed_region.text())
@@ -2612,6 +2627,8 @@ class ControlPanel(QMainWindow):
             "project": self.project_edit.text().strip(),
             "region": self.region_edit.text().strip() or "global",
         }
+        if PROVIDERS[self._current_provider]["kind"] == "vertex":
+            self._share_google_project(self.project_edit.text().strip())
 
     def _on_provider_changed(self, name):
         self._store_profile()

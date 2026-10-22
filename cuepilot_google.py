@@ -17,7 +17,7 @@ optional 'google-auth' package. No Qt dependency, so it can be unit-tested on it
 """
 from __future__ import annotations
 
-BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
+BUILD = "2026.10.21-8"  # must match APP_BUILD in cuepilot.py
 
 import json
 import os

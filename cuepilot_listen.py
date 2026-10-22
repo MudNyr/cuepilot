@@ -17,7 +17,7 @@ rather than failing. This module has no Qt dependency, so it can be unit-tested 
 """
 from __future__ import annotations
 
-BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
+BUILD = "2026.10.21-8"  # must match APP_BUILD in cuepilot.py
 
 import array
 import io
