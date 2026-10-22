@@ -17,7 +17,7 @@ optional 'google-auth' package. No Qt dependency, so it can be unit-tested on it
 """
 from __future__ import annotations
 
-BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
+BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
 
 import json
 import os
@@ -166,6 +166,79 @@ def _gcloud_token(have_file: bool):
         raise GoogleAuthError(f"The Google Cloud CLI couldn't get a token ({msg[0][:160]}). "
                               + SIGN_IN_HELP)
     return token, 3000
+
+
+# --------------------------------------------------------------------------- embeddings
+EMBED_WORKERS = 6         # gemini-embedding-001 takes one text per request, so send several at once
+EMBED_RETRY_CODES = (429, 500, 502, 503, 504)
+TASK_TYPES = {"document": "RETRIEVAL_DOCUMENT", "query": "RETRIEVAL_QUERY"}
+
+
+def vertex_embed_url(project: str, region: str, model: str) -> str:
+    region = (region or "us-central1").strip()
+    host = "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
+    return (f"https://{host}/v1/projects/{urllib.parse.quote(project.strip())}/locations/{region}"
+            f"/publishers/google/models/{urllib.parse.quote(model.strip(), safe='@.-_')}:predict")
+
+
+def vertex_embed(cfg: dict, texts, input_type=None, timeout: float = 60, retries: int = 4):
+    """Embed texts with a Google model on Vertex AI using your Google sign-in. Returns one vector
+    per text, in order. Rate limits (429) and temporary errors are retried with a backoff."""
+    project = (cfg.get("project") or "").strip()
+    model = (cfg.get("model") or "gemini-embedding-001").strip()
+    if not project:
+        raise RuntimeError("Enter your Google Cloud project ID for document search.")
+    url = vertex_embed_url(project, cfg.get("region") or "us-central1", model)
+    task = TASK_TYPES.get(input_type or "")
+    try:
+        access_token()  # sign in once up front, so parallel requests share the token
+    except GoogleAuthError as exc:
+        raise RuntimeError(str(exc)) from None
+
+    def one(text):
+        instance = {"content": text}
+        if task:
+            instance["task_type"] = task
+        body = {"instances": [instance]}
+        attempt = 0
+        refreshed = False
+        while True:
+            token, quota = access_token()
+            try:
+                data = _post(url, body, token, quota, timeout)
+                return data["predictions"][0]["embeddings"]["values"]
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401 and not refreshed:
+                    refreshed = True
+                    try:
+                        access_token(force_refresh=True)
+                    except GoogleAuthError as auth_exc:
+                        raise RuntimeError(str(auth_exc)) from None
+                    continue
+                if exc.code in EMBED_RETRY_CODES and attempt < retries:
+                    wait = None
+                    try:
+                        wait = float(exc.headers.get("Retry-After"))
+                    except Exception:
+                        pass
+                    time.sleep(max(0.5, min(wait if wait is not None else 2.0 ** attempt, 30.0)))
+                    attempt += 1
+                    continue
+                raise RuntimeError("Document search: " + _vertex_error(exc).replace(
+                    "the model ID (copy it from Model Garden)", "the embeddings model name")) from None
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Could not reach {urllib.parse.urlsplit(url).netloc}: "
+                                   f"{exc.reason}.") from None
+            except (KeyError, IndexError, TypeError):
+                raise RuntimeError("Google Cloud sent an unexpected embeddings reply. Check the "
+                                   "model name.") from None
+
+    texts = list(texts)
+    if len(texts) <= 1:
+        return [one(t) for t in texts]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
+        return list(pool.map(one, texts))
 
 
 # --------------------------------------------------------------------------- Claude on Vertex

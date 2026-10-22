@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox,
 
 APP_NAME = "CuePilot"
 APP_VERSION = "1.0"
-APP_BUILD = "2026.10.21-5"  # all CuePilot files must carry the same build
+APP_BUILD = "2026.10.21-7"  # all CuePilot files must carry the same build
 IS_WINDOWS = sys.platform == "win32"
 
 # Palette: a studio control room. Slate surfaces, an amber cue light, a red tally for "live".
@@ -221,6 +221,12 @@ PROVIDERS = {
         "env": "ANTHROPIC_API_KEY", "needs_key": True,
         "hint": "Get a key at console.anthropic.com. Leave the key blank to use the "
                 "ANTHROPIC_API_KEY environment variable. For faster answers try claude-haiku-5-5."},
+    "Groq (free, no card)": {
+        "kind": "openai", "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile", "env": "GROQ_API_KEY", "needs_key": True,
+        "hint": "Free with no card; uses the same Groq key as transcription (console.groq.com/keys). "
+                "Runs open models rather than Claude: llama-3.3-70b-versatile gives better answers, "
+                "llama-3.1-8b-instant is fastest. The free tier is rate-limited."},
     "Claude on Google Cloud (Vertex AI)": {
         "kind": "vertex", "base_url": "", "model": "claude-sonnet-5-5", "env": "",
         "needs_key": False,
@@ -281,7 +287,7 @@ DEFAULTS = {
     "auto_answer_questions": False,
     "listen_consent_ack": False,
     "doc_path": "",
-    "embed_provider": "Voyage AI (recommended by Anthropic)",
+    "embed_provider": "Google Cloud (Vertex AI)",
     "embed_profiles": {},
     "use_contextual": True,
     "project_doc_on_question": True,
@@ -345,7 +351,7 @@ def load_settings() -> dict:
             prof.setdefault("model", meta["model"])
             prof.setdefault("api_key", "")
         if s["embed_provider"] not in docs.EMBED_PROVIDERS:
-            s["embed_provider"] = "Voyage AI (recommended by Anthropic)"
+            s["embed_provider"] = "Google Cloud (Vertex AI)"
     if s["provider"] not in PROVIDERS:
         s["provider"] = DEFAULT_PROVIDER
     return s
@@ -488,13 +494,23 @@ REWRITE_ACTIONS = {
 }
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: float):
+def _http_post_json(url: str, body: dict, headers: dict, timeout: float, _retried=False):
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                  headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        if exc.code == 429 and not _retried:
+            # Free tiers ask you to wait a few seconds; wait once if it's short, then retry.
+            try:
+                wait = float(exc.headers.get("Retry-After") or 2)
+            except Exception:
+                wait = 2.0
+            if wait <= 6:
+                import time as _time
+                _time.sleep(max(0.5, wait))
+                return _http_post_json(url, body, headers, timeout, _retried=True)
         detail = ""
         raw = ""
         try:
@@ -2039,10 +2055,17 @@ class ControlPanel(QMainWindow):
         self.embed_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.embed_key.setPlaceholderText("Paste your embeddings API key")
         self.embed_model = QLineEdit()
+        self.embed_project = QLineEdit()
+        self.embed_project.setPlaceholderText("Your Google Cloud project ID")
+        self.embed_region = QLineEdit()
+        self.embed_region.setPlaceholderText("us-central1")
         form.addRow("Embeddings", self.embed_combo)
         form.addRow("Server URL", self.embed_url)
         form.addRow("API key", self.embed_key)
+        form.addRow("Project ID", self.embed_project)
+        form.addRow("Region", self.embed_region)
         form.addRow("Model", self.embed_model)
+        self.embed_form = form
         eb.addLayout(form)
         eb.addWidget(label("Smart search embeds your document once when you upload it. Contextual "
                            "search (on by default) also adds a one-line context note to each "
@@ -2086,7 +2109,8 @@ class ControlPanel(QMainWindow):
         self._load_embed_profile(self._current_embed)
         self._loading_embed = False
         self.embed_combo.currentTextChanged.connect(self._on_embed_provider_changed)
-        for edit in (self.embed_url, self.embed_key, self.embed_model):
+        for edit in (self.embed_url, self.embed_key, self.embed_model, self.embed_project,
+                     self.embed_region):
             edit.textChanged.connect(self._store_embed_profile)
         self.embed_box.setVisible(self.contextual_chk.isChecked())
 
@@ -2099,6 +2123,18 @@ class ControlPanel(QMainWindow):
         self.embed_url.setText(prof.get("base_url", meta["base_url"]))
         self.embed_key.setText(prof.get("api_key", ""))
         self.embed_model.setText(prof.get("model", meta["model"]))
+        vertex = meta.get("kind") == "vertex"
+        project = prof.get("project", "")
+        if vertex and not project:  # reuse the project already set up for Claude on Google Cloud
+            project = self.s["ai_profiles"].get("Claude on Google Cloud (Vertex AI)", {}).get("project", "")
+        self.embed_project.setText(project)
+        self.embed_region.setText(prof.get("region", "") or meta.get("region", ""))
+        for widget, show in ((self.embed_url, not vertex), (self.embed_key, not vertex),
+                             (self.embed_project, vertex), (self.embed_region, vertex)):
+            try:
+                self.embed_form.setRowVisible(widget, show)
+            except Exception:
+                widget.setVisible(show)
 
     def _store_embed_profile(self, *_):
         if getattr(self, "_loading_embed", False):
@@ -2107,6 +2143,8 @@ class ControlPanel(QMainWindow):
             "base_url": self.embed_url.text().strip(),
             "api_key": self.embed_key.text().strip(),
             "model": self.embed_model.text().strip(),
+            "project": self.embed_project.text().strip(),
+            "region": self.embed_region.text().strip(),
         }
 
     def _on_embed_provider_changed(self, name):
@@ -2125,7 +2163,8 @@ class ControlPanel(QMainWindow):
 
     def _embed_config(self):
         return docs.build_embed_config(self._current_embed, self.embed_url.text(),
-                                       self.embed_key.text(), self.embed_model.text())
+                                       self.embed_key.text(), self.embed_model.text(),
+                                       self.embed_project.text(), self.embed_region.text())
 
     def _load_document(self, path=None):
         if not path:
@@ -2545,7 +2584,10 @@ class ControlPanel(QMainWindow):
     def _load_profile(self, name):
         prof = self.s["ai_profiles"][name]
         self.url_edit.setText(prof.get("base_url", ""))
-        self.key_edit.setText(prof.get("api_key", ""))
+        key = prof.get("api_key", "")
+        if not key and name == "Groq (free, no card)":  # same key as transcription
+            key = self.s.get("stt_profiles", {}).get("Groq (free, cloud)", {}).get("api_key", "")
+        self.key_edit.setText(key)
         self.model_edit.setText(prof.get("model", ""))
         self.project_edit.setText(prof.get("project", ""))
         self.region_edit.setText(prof.get("region", "global") or "global")

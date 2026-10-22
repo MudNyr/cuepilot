@@ -17,7 +17,7 @@ This module has no Qt dependency, so it can be unit-tested on its own.
 """
 from __future__ import annotations
 
-BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
+BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
 
 import json
 import math
@@ -52,6 +52,9 @@ STOPWORDS = {
 }
 
 EMBED_PROVIDERS = {
+    # Uses the same Google sign-in as Claude on Google Cloud; billed to your Google Cloud project.
+    "Google Cloud (Vertex AI)": {"kind": "vertex", "base_url": "", "model": "gemini-embedding-001",
+                                 "env": "", "region": "us-central1"},
     # Anthropic doesn't make an embeddings model; its docs recommend Voyage AI.
     "Voyage AI (recommended by Anthropic)": {"base_url": "https://api.voyageai.com/v1",
                                              "model": "voyage-4-lite", "env": "VOYAGE_API_KEY"},
@@ -61,7 +64,10 @@ EMBED_PROVIDERS = {
     "Google Gemini (free tier, no card)": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "model": "gemini-embedding-001", "env": "GEMINI_API_KEY"},
-    "Custom (OpenAI-compatible)": {"base_url": "", "model": "", "env": ""},
+    # Free and local: install Ollama, then run 'ollama pull nomic-embed-text'. No account or key.
+    "Ollama (local, free)": {"base_url": "http://localhost:11434/v1", "model": "nomic-embed-text",
+                             "env": "", "needs_key": False},
+    "Custom (OpenAI-compatible)": {"base_url": "", "model": "", "env": "", "needs_key": False},
 }
 
 
@@ -354,6 +360,16 @@ def _is_voyage(base: str) -> bool:
 def embed_texts(cfg: dict, texts, timeout=120, input_type=None, retries=4):
     """Return a list of vectors for the given texts via an OpenAI-style embeddings endpoint.
     input_type ('document' or 'query') is sent to Voyage, which matches better with it."""
+    if cfg.get("kind") == "vertex":
+        try:
+            import cuepilot_google as gcp
+        except Exception:
+            raise DocError("Google Cloud support isn't available in this build.") from None
+        try:
+            return gcp.vertex_embed(cfg, texts, input_type=input_type, timeout=min(timeout, 60),
+                                    retries=retries)
+        except Exception as exc:
+            raise DocError(str(exc)) from None
     base = cfg["base_url"].strip().rstrip("/")
     if not base:
         raise DocError("No embeddings server URL is set.")
@@ -554,15 +570,21 @@ def _passage_context(context_ai, full_doc: str, passage: str) -> str:
     return (text or "").strip().replace("\n", " ")[:200]
 
 
-def build_embed_config(provider_name: str, url: str, key: str, model: str):
+def build_embed_config(provider_name: str, url: str, key: str, model: str, project: str = "",
+                       region: str = ""):
     meta = EMBED_PROVIDERS.get(provider_name, EMBED_PROVIDERS["Custom (OpenAI-compatible)"])
     if not model.strip():
         return None, "Enter an embeddings model name."
+    if meta.get("kind") == "vertex":
+        if not project.strip():
+            return None, "Enter your Google Cloud project ID for document search."
+        return {"kind": "vertex", "project": project.strip(), "model": model.strip(),
+                "region": region.strip() or meta.get("region", "us-central1")}, None
     if not url.strip():
         return None, "Enter the embeddings server URL."
     if not key.strip() and meta.get("env"):
         key = os.environ.get(meta["env"], "")
-    if not key.strip():
+    if not key.strip() and meta.get("needs_key", True):
         return None, f"Add an API key for {provider_name} embeddings."
     url = re.sub(r"/vi(?=/|$)", "/v1", url.strip().rstrip("/"), flags=re.IGNORECASE)
     if url.lower().endswith("/embeddings"):

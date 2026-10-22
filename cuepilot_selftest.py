@@ -30,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
-SELFTEST_BUILD = "2026.10.21-5"  # must match APP_BUILD in cuepilot.py
+SELFTEST_BUILD = "2026.10.21-7"  # must match APP_BUILD in cuepilot.py
 IS_WIN = sys.platform == "win32"
 
 SCRIPT_REPLY = "```\n# Opening\nHello team.\n\nThis is the **drafted** script. [PAUSE]\n```"
@@ -195,6 +195,39 @@ def start_mock_embed_server(vec_fn):
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}", calls
+
+
+def start_mock_vertex_embed_server(vec_fn):
+    """A fake Vertex AI :predict endpoint. Like the real gemini-embedding-001, it refuses more
+    than one text per request."""
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            inst = body.get("instances") or []
+            calls.append({"path": self.path, "n": len(inst),
+                          "task": inst[0].get("task_type") if inst else None,
+                          "auth": self.headers.get("Authorization")})
+            if len(inst) != 1:
+                out, code = {"error": {"message": "Only one instance per request is supported."}}, 400
+            else:
+                out, code = {"predictions": [{"embeddings": {"values": vec_fn(inst[0]["content"])}}]}, 200
+            data = json.dumps(out).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
 
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     srv.daemon_threads = True
@@ -1020,6 +1053,19 @@ class SelfTest:
         self.ai_wait()
         self.check("Ollama works without a key", p.ai_status.text().startswith("Connected"), p.ai_status.text())
 
+        # Groq for answers: free, no card, reuses the transcription key
+        s["stt_profiles"].setdefault("Groq (free, cloud)", {})["api_key"] = "gsk_from_transcription"
+        self.set_provider("Groq (free, no card)")
+        self.check("Groq is offered for answers with its address filled in",
+                   p.url_edit.text() == "https://api.groq.com/openai/v1", p.url_edit.text())
+        self.check("Groq reuses the transcription key", p.key_edit.text() == "gsk_from_transcription",
+                   p.key_edit.text())
+        p.url_edit.setText(base + "/openai/v1")
+        p.test_btn.click()
+        self.ai_wait()
+        self.check("answers work through Groq", p.ai_status.text().startswith("Connected"),
+                   p.ai_status.text())
+
         # Claude on Google Cloud (Vertex AI): Google sign-in instead of a key
         gcp = getattr(cp, "gcp", None)
         if gcp is None:
@@ -1491,6 +1537,55 @@ class SelfTest:
             self.check("smart-search result is still the document's own text (verbatim)",
                        r["text"] in sample, r["text"][:60])
             srv.shutdown()
+
+        with self.step("Document: free local search"):
+            lcfg, lerr = docs.build_embed_config("Ollama (local, free)", "http://localhost:11434/v1",
+                                                 "", "nomic-embed-text")
+            self.check("local smart search needs no key or card", lerr is None, lerr)
+
+        with self.step("Document: Google Cloud search"):
+            gcp = getattr(cp, "gcp", None)
+            if gcp is None:
+                self.log(FAIL, "Google Cloud module failed to import", "cuepilot_google.py missing")
+            else:
+                vocab = "org spoke hub throughput concurrency load encryption pii shield scaling".split()
+                vsrv, vbase, vcalls = start_mock_vertex_embed_server(
+                    lambda t: [float(t.lower().count(w)) + 0.01 for w in vocab])
+                real_url, real_token = gcp.vertex_embed_url, gcp.access_token
+                gcp.vertex_embed_url = lambda project, region, model: (
+                    f"{vbase}/v1/projects/{project}/locations/{region}/publishers/google/models/"
+                    f"{model}:predict")
+                gcp.access_token = lambda force_refresh=False: ("vertex-token", None)
+                try:
+                    gcfg, gerr = docs.build_embed_config("Google Cloud (Vertex AI)", "", "",
+                                                         "gemini-embedding-001", "my-proj", "")
+                    self.check("Google Cloud search is set up from a project ID alone",
+                               gerr is None and gcfg["region"] == "us-central1", f"{gerr} {gcfg}")
+                    gdoc = docs.ReferenceDoc("ref.txt")
+                    gdoc.load_text(sample)
+                    gdoc.build_embeddings(gcfg)
+                    self.check("the document is prepared through Google Cloud", gdoc.embedded)
+                    self.check("one passage is sent per request, as Google requires",
+                               vcalls and {c["n"] for c in vcalls} == {1}, f"{[c['n'] for c in vcalls]}")
+                    self.check("passages are labelled as documents",
+                               {c["task"] for c in vcalls} == {"RETRIEVAL_DOCUMENT"})
+                    self.check("the Google sign-in token is sent",
+                               {c["auth"] for c in vcalls} == {"Bearer vertex-token"})
+                    gr = gdoc.search_semantic("how do you handle encryption of pii", gcfg)[0]
+                    self.check("questions are labelled as queries", vcalls[-1]["task"] == "RETRIEVAL_QUERY")
+                    self.check("Google Cloud search finds the right passage",
+                               "Shield" in gr["heading"] and gr["text"] in sample, gr["heading"])
+                    # the settings panel shows the right fields and reuses the Claude project
+                    p.embed_combo.setCurrentText("Google Cloud (Vertex AI)")
+                    self.pump()
+                    self.check("document search shows project and region for Google Cloud",
+                               not p.embed_project.isHidden() and p.embed_key.isHidden()
+                               and p.embed_url.isHidden())
+                    self.check("it reuses the project ID set up for Claude on Google Cloud",
+                               p.embed_project.text() == "my-proj", p.embed_project.text())
+                finally:
+                    gcp.vertex_embed_url, gcp.access_token = real_url, real_token
+                    vsrv.shutdown()
 
         with self.step("Document: controls"):
             if not hasattr(p, "doc_name_lbl"):

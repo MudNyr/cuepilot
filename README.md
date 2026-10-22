@@ -24,6 +24,19 @@ The amber band is the reading line; read the line inside it. The thin bar along 
 
 With **Hide CuePilot from screen sharing and recordings** on (the default), others won't see the prompter or the control panel even if you share your whole screen. This needs Windows 10 version 2004 or later; older versions show a black box instead. Sharing only a single window or a browser tab never shows CuePilot either way.
 
+## Free setup (no card anywhere)
+
+Claude itself always needs billing, but everything else in CuePilot runs free with no payment method:
+
+| Job | Free option | What you need |
+|---|---|---|
+| Answers and question detection | **Groq (free, no card)** in the AI section | A free key from console.groq.com/keys (no card). CuePilot reuses your transcription key. Uses open models such as `llama-3.3-70b-versatile` instead of Claude. |
+| Transcription | **Groq (free, cloud)** in Listen and answer | The same Groq key |
+| Document search | **Keyword search** (automatic) | Nothing |
+| Smart document search (optional) | **Ollama (local, free)** in Smart search | Install Ollama from ollama.com, then run `ollama pull nomic-embed-text`. Runs on your laptop; no account. |
+
+Free tiers have rate limits. If Groq briefly says "slow down," CuePilot waits a moment and retries.
+
 ## AI assistant
 
 Open the **AI assistant** tab and choose a provider:
@@ -106,11 +119,11 @@ Supported files: PDF, Word (.docx), and plain text or markdown.
 
 | Search | Needs | What it does |
 |---|---|---|
-| Contextual | an embeddings key (e.g. Voyage AI) + your Claude key | Before matching, it adds a one-line note to each passage saying where it sits in the document, so an isolated paragraph about "throughput under load" still matches a question about "scaling". On by default. |
+| Contextual | Google Cloud sign-in, or an embeddings key (e.g. Voyage AI), plus Claude | Before matching, it adds a one-line note to each passage saying where it sits in the document, so an isolated paragraph about "throughput under load" still matches a question about "scaling". On by default. |
 | Smart (semantic) | an embeddings key | Matches by meaning, so different words for the same idea still match. |
 | Keyword | nothing | Matches shared words. Free, offline, instant. Always available as a fallback. |
 
-Smart and contextual search use an embeddings API. Anthropic doesn't make an embeddings model and recommends Voyage AI, so that's the default (`voyage-4-lite`; get a key at voyageai.com). OpenAI's and Gemini's embeddings work too. Set it under **Smart search** in the document section. The document is embedded once when you upload it, which takes a few seconds; after that each question is one tiny lookup. Contextual search also makes one small call per passage to your main AI when the document loads, to write those context notes. Without an embeddings key, keyword search still works.
+Smart and contextual search use an embeddings service. The default is **Google Cloud (Vertex AI)**, which uses the same Google sign-in as Claude on Google Cloud and bills to your project; enter your project ID and leave the region as `us-central1`. Anthropic doesn't make an embeddings model and recommends Voyage AI, which is also available (`voyage-4-lite`; get a key at voyageai.com). OpenAI's and Gemini's embeddings work too. Set it under **Smart search** in the document section. The document is embedded once when you upload it, which takes a few seconds; after that each question is one tiny lookup. Contextual search also makes one small call per passage to your main AI when the document loads, to write those context notes. Without an embeddings key, keyword search still works.
 
 How to use it:
 
